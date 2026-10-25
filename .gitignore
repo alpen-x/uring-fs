@@ -1,0 +1,8 @@
+node_modules/
+build/
+bench_tmp/
+hello_uring
+test_poll_uring
+output_uring.txt
+*.tgz
+.DS_Store

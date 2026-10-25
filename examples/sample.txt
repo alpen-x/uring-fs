@@ -1,0 +1,4 @@
+Hello from the Linux Kernel via io_uring!
+If you are reading this message, the kernel executed this file read
+completely asynchronously using shared ring buffers (SQ and CQ),
+without blocking user-space threads or issuing synchronous read() syscalls.

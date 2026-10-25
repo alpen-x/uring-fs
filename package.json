@@ -1,0 +1,64 @@
+{
+  "name": "uring-fs",
+  "version": "1.0.0",
+  "description": "True asynchronous Linux io_uring filesystem I/O for Node.js with zero libuv thread-pool usage, automatic tick batching, and pluggable fallback backends.",
+  "main": "index.js",
+  "module": "index.mjs",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs",
+      "require": "./index.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.mjs",
+    "index.d.ts",
+    "lib/worker_fallback.js",
+    "binding.gyp",
+    "src/addon.cc",
+    "src/addon_stub.cc"
+  ],
+  "scripts": {
+    "install": "node-gyp rebuild",
+    "build": "node-gyp rebuild",
+    "test": "node --test test/suite.test.js",
+    "benchmark": "node benchmark.js",
+    "benchmark:starvation": "node starvation_test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alpen-x/uring-fs.git"
+  },
+  "homepage": "https://github.com/alpen-x/uring-fs#readme",
+  "bugs": {
+    "url": "https://github.com/alpen-x/uring-fs/issues"
+  },
+  "keywords": [
+    "io_uring",
+    "uring-fs",
+    "linux",
+    "fs",
+    "filesystem",
+    "async",
+    "non-blocking",
+    "liburing",
+    "libuv",
+    "performance",
+    "napi"
+  ],
+  "author": "Alberto Pena <alpenx.dev@gmail.com> (https://github.com/alpen-x)",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "node-addon-api": "^8.7.0"
+  },
+  "devDependencies": {
+    "node-gyp": "^12.4.0"
+  },
+  "gypfile": true
+}
