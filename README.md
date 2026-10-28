@@ -1,6 +1,6 @@
 # `uring-fs` (`io_uring` File System for Node.js)
 
-**True asynchronous filesystem I/O for Node.js on Linux powered by `io_uring` — with zero `libuv` thread-pool contention, 99% syscall reduction via Tick Auto-Batching, and a 3-Tier Pluggable Fallback System.**
+**True asynchronous filesystem I/O for Node.js on Linux powered by `io_uring` — with zero `libuv` thread-pool contention, 99% syscall reduction via Tick Auto-Batching, in-kernel zero-copy `splice`, and a 3-Tier Pluggable Fallback System.**
 
 ---
 
@@ -11,10 +11,12 @@ In Node.js, network I/O is non-blocking via `epoll`, but regular file I/O (`node
 When a server performs CPU-bound thread-pool work (such as password hashing, TLS/crypto, or Gzip/Brotli compression), `fs.promises.readFile` stalls in the queue waiting for a worker thread.
 
 **`uring-fs`** solves this by:
-1. **100% Asynchronous Kernel State Machine:** Executes `openat` ➔ `statx` ➔ `read`/`write` ➔ `close` entirely inside the Linux kernel's `io_uring` submission/completion rings (`SQ`/`CQ`), using **zero `libuv` worker threads**.
+1. **100% Asynchronous Kernel State Machine:** Executes `openat`, `statx`, `read`, `write`, `splice`, `fsync`, `renameat`, `symlinkat`, `linkat`, `mkdirat`, `unlinkat`, and `close` entirely inside the Linux kernel's `io_uring` submission/completion rings (`SQ`/`CQ`), using **zero `libuv` worker threads**.
 2. **Tick Auto-Batching (`uv_prepare_t` + `uv_check_t`):** Automatically batches concurrent file operations issued in the same Event Loop tick into a single `io_uring_enter` syscall (saving up to **99% of syscalls**).
 3. **Modern Kernel Optimizations (`SINGLE_ISSUER` + `COOP_TASKRUN`):** Automatically enables `IORING_SETUP_SINGLE_ISSUER` and `IORING_SETUP_COOP_TASKRUN` on Linux 6.0+ (with graceful fallback on older kernels) to eliminate kernel submission spinlocks and inter-processor interrupts (IPIs).
-4. **Zero-Copy V8 Buffer Handoff:** Transfers kernel-read memory buffers directly to V8's garbage collector without an intermediate `memcpy`.
+4. **Zero-Copy V8 Buffer Handoff & In-Kernel `splice` Copy:**
+   - `readFile` transfers kernel-read memory buffers directly to V8's garbage collector without an intermediate `memcpy`.
+   - `copyFile` uses `io_uring_prep_splice` (`IORING_OP_SPLICE`) to move bytes directly between file descriptors inside the Linux kernel page cache with **zero user-space memory allocation**.
 5. **CVE-2024-22017 Credential Guard:** Tracks `geteuid()` / `getegid()` per batch and automatically resets the ring if process privileges change.
 6. **3-Tier Pluggable Fallback System:** Works everywhere (macOS, Windows, restricted Docker) with your choice of:
    - `'fs'` (default): `node:fs/promises`
@@ -68,7 +70,13 @@ import {
   appendFile,
   copyFile,
   stat,
+  lstat,
   mkdir,
+  rename,
+  symlink,
+  link,
+  fsync,
+  fdatasync,
   unlink,
   isUringSupported,
   getRingStats,
@@ -77,20 +85,49 @@ import {
 
 console.log('io_uring active:', isUringSupported());
 
-await writeFile('hello.txt', 'Hello from Linux Kernel io_uring!\n');
+// Write with optional in-kernel fsync before close ({ flush: true })
+await writeFile('hello.txt', 'Hello from Linux Kernel io_uring!\n', { flush: true });
 await appendFile('hello.txt', 'Appended asynchronously.\n');
+
+// Zero-copy in-kernel file copy via io_uring_prep_splice
+await copyFile('hello.txt', 'hello_copy.txt');
+
+// Atomic rename, symlinks, hardlinks, and lstat
+await rename('hello_copy.txt', 'hello_renamed.txt');
+await symlink('hello.txt', 'hello.link');
+const linkInfo = await lstat('hello.link');
+console.log('Is symlink:', linkInfo.isSymbolicLink());
 
 const content = await readFile('hello.txt', 'utf8');
 console.log(content);
 
-const info = await stat('hello.txt');
-console.log('File size:', info.size, 'isFile:', info.isFile());
-
 // Inspect ring telemetry and syscall savings
 console.log(getRingStats());
 
+await unlink('hello.link');
+await unlink('hello_renamed.txt');
 await unlink('hello.txt');
 ```
+
+---
+
+## Supported API
+
+| Function | Kernel `io_uring` Opcode(s) | Description |
+| :--- | :--- | :--- |
+| `readFile(path, options?)` | `OPENAT` ➔ `STATX` ➔ `READ` ➔ `CLOSE` | Reads entire file with zero-copy V8 external buffer handoff |
+| `writeFile(path, data, options?)` | `OPENAT` ➔ `WRITE` (➔ `FSYNC`) ➔ `CLOSE` | Writes `string`, `Buffer`, or `Uint8Array` (supports `{ flush: true }`) |
+| `appendFile(path, data, options?)` | `OPENAT(O_APPEND)` ➔ `WRITE` ➔ `CLOSE` | Appends data atomically at end of file |
+| `copyFile(src, dest, mode?)` | `OPENAT` ➔ `STATX` ➔ `SPLICE` ➔ `CLOSE` | Zero-copy kernel-to-kernel copy via `io_uring_prep_splice` |
+| `stat(path, options?)` | `STATX` (`0`) | Retrieves `UringStats` (follows symlinks) |
+| `lstat(path, options?)` | `STATX` (`AT_SYMLINK_NOFOLLOW`) | Retrieves `UringStats` without following symlinks |
+| `rename(oldPath, newPath, options?)` | `RENAMEAT` | Atomically renames/moves a file or directory |
+| `symlink(target, path, options?)` | `SYMLINKAT` | Creates a symbolic link |
+| `link(existingPath, newPath, options?)` | `LINKAT` | Creates a hard link |
+| `fsync(path, options?)` | `OPENAT` ➔ `FSYNC` (`0`) ➔ `CLOSE` | Flushes modified file data and metadata to disk |
+| `fdatasync(path, options?)` | `OPENAT` ➔ `FSYNC` (`DATASYNC`) ➔ `CLOSE` | Flushes modified file data to disk |
+| `mkdir(path, options?)` | `MKDIRAT` | Creates a directory (single or `{ recursive: true }`) |
+| `unlink(path, options?)` | `UNLINKAT` | Removes a file or symbolic link |
 
 ---
 

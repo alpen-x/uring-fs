@@ -1,6 +1,6 @@
 {
   "name": "uring-fs",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "True asynchronous Linux io_uring filesystem I/O for Node.js with zero libuv thread-pool usage, automatic tick batching, and pluggable fallback backends.",
   "main": "index.js",
   "module": "index.mjs",

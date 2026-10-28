@@ -9,8 +9,14 @@ export interface CustomFsProvider {
   appendFile?: (path: string, data: any, options?: any) => Promise<void>;
   copyFile?: (src: string, dest: string, mode?: number) => Promise<void>;
   stat: (path: string) => Promise<any>;
+  lstat?: (path: string) => Promise<any>;
   unlink: (path: string) => Promise<void>;
   mkdir: (path: string, options?: any) => Promise<string | undefined>;
+  rename?: (oldPath: string, newPath: string) => Promise<void>;
+  symlink?: (target: string, path: string, type?: string) => Promise<void>;
+  link?: (existingPath: string, newPath: string) => Promise<void>;
+  fsync?: (path: string) => Promise<void>;
+  fdatasync?: (path: string) => Promise<void>;
 }
 
 export type FallbackStrategy =
@@ -41,6 +47,10 @@ export interface UringWriteOptions extends UringCommonOptions {
   encoding?: BufferEncoding | null;
   mode?: number;
   flag?: string | number;
+  /**
+   * When `true`, flushes all data to the underlying storage device via `io_uring_prep_fsync` before closing.
+   */
+  flush?: boolean;
   signal?: AbortSignal;
 }
 
@@ -145,12 +155,36 @@ export function copyFile(
 
 export function stat(path: PathLike, options?: UringCommonOptions): Promise<UringStats>;
 
+export function lstat(path: PathLike, options?: UringCommonOptions): Promise<UringStats>;
+
 export function unlink(path: PathLike, options?: UringCommonOptions): Promise<void>;
 
 export function mkdir(
   path: PathLike,
   options?: number | UringMkdirOptions
 ): Promise<string | undefined>;
+
+export function rename(
+  oldPath: PathLike,
+  newPath: PathLike,
+  options?: UringCommonOptions
+): Promise<void>;
+
+export function symlink(
+  target: PathLike,
+  path: PathLike,
+  typeOrOptions?: string | UringCommonOptions
+): Promise<void>;
+
+export function link(
+  existingPath: PathLike,
+  newPath: PathLike,
+  options?: UringCommonOptions
+): Promise<void>;
+
+export function fsync(path: PathLike, options?: UringCommonOptions): Promise<void>;
+
+export function fdatasync(path: PathLike, options?: UringCommonOptions): Promise<void>;
 
 export function isUringSupported(): boolean;
 export function getActiveBackend(): 'io_uring' | 'worker' | 'custom' | 'fs' | 'none';

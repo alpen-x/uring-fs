@@ -356,6 +356,7 @@ async function writeFile(filePath, data, options) {
   let encoding = 'utf8';
   let mode = 0o666;
   let flag = 'w';
+  let flush = false;
   let signal = undefined;
 
   if (typeof options === 'string') {
@@ -364,6 +365,7 @@ async function writeFile(filePath, data, options) {
     if (options.encoding) encoding = options.encoding;
     if (options.mode !== undefined) mode = options.mode;
     if (options.flag !== undefined) flag = options.flag;
+    if (options.flush !== undefined) flush = Boolean(options.flush);
     signal = options.signal;
   }
 
@@ -375,12 +377,12 @@ async function writeFile(filePath, data, options) {
   const backend = selectExecutionBackend(options);
 
   if (backend.type === 'provider') {
-    await backend.provider.writeFile(normalized, data, { encoding, mode, flag, signal });
+    await backend.provider.writeFile(normalized, data, { encoding, mode, flag, flush, signal });
     return;
   }
 
   if (backend.type === 'worker') {
-    const workerPromise = getWorkerPool().exec('writeFile', [normalized, data, { encoding, mode, flag }]);
+    const workerPromise = getWorkerPool().exec('writeFile', [normalized, data, { encoding, mode, flag, flush }]);
     await wrapWithAbortSignal(workerPromise, signal);
     return;
   }
@@ -391,7 +393,7 @@ async function writeFile(filePath, data, options) {
     payload = Buffer.from(data, encoding);
   }
 
-  const rawPromise = native.writeFile(normalized, payload, numericFlags, mode);
+  const rawPromise = native.writeFile(normalized, payload, numericFlags, mode, flush);
   await wrapWithAbortSignal(rawPromise, signal);
 }
 
@@ -406,7 +408,7 @@ async function appendFile(filePath, data, options) {
 }
 
 /**
- * Copies a file asynchronously via io_uring (or configured fallback).
+ * Copies a file asynchronously inside kernel space via io_uring splice (zero-copy).
  */
 async function copyFile(srcPath, destPath, options) {
   let mode = 0;
@@ -433,15 +435,12 @@ async function copyFile(srcPath, destPath, options) {
     return getWorkerPool().exec('copyFile', [srcNormalized, destNormalized, mode]);
   }
 
-  const content = await native.readFile(srcNormalized);
-  const writeFlags = (mode & fsConstants.COPYFILE_EXCL)
-    ? (fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_EXCL)
-    : (fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC);
-  await native.writeFile(destNormalized, content, writeFlags, 0o666);
+  const copyFlags = (mode & fsConstants.COPYFILE_EXCL) ? 1 : 0;
+  await native.copyFile(srcNormalized, destNormalized, copyFlags);
 }
 
 /**
- * Retrieves file or directory metadata via io_uring statx (without blocking the thread pool).
+ * Retrieves file or directory metadata via io_uring statx (following symlinks).
  */
 async function stat(filePath, options) {
   const normalized = normalizePath(filePath);
@@ -461,7 +460,30 @@ async function stat(filePath, options) {
 }
 
 /**
- * Removes a file asynchronously via io_uring unlinkat.
+ * Retrieves file, directory, or symbolic link metadata via io_uring statx (AT_SYMLINK_NOFOLLOW).
+ */
+async function lstat(filePath, options) {
+  const normalized = normalizePath(filePath);
+  const backend = selectExecutionBackend(options);
+
+  if (backend.type === 'provider') {
+    if (typeof backend.provider.lstat === 'function') {
+      return backend.provider.lstat(normalized);
+    }
+    return backend.provider.stat(normalized);
+  }
+
+  if (backend.type === 'worker') {
+    const raw = await getWorkerPool().exec('lstat', [normalized]);
+    return new UringStats(raw);
+  }
+
+  const raw = await native.lstat(normalized);
+  return new UringStats(raw);
+}
+
+/**
+ * Removes a file or symbolic link asynchronously via io_uring unlinkat.
  */
 async function unlink(filePath, options) {
   const normalized = normalizePath(filePath);
@@ -535,14 +557,139 @@ async function mkdir(dirPath, options) {
   }
 }
 
+/**
+ * Atomically renames or moves a file or directory via io_uring renameat.
+ */
+async function rename(oldPath, newPath, options) {
+  const oldNormalized = normalizePath(oldPath);
+  const newNormalized = normalizePath(newPath);
+  const backend = selectExecutionBackend(options);
+
+  if (backend.type === 'provider') {
+    return backend.provider.rename(oldNormalized, newNormalized);
+  }
+
+  if (backend.type === 'worker') {
+    await getWorkerPool().exec('rename', [oldNormalized, newNormalized]);
+    return;
+  }
+
+  await native.rename(oldNormalized, newNormalized);
+}
+
+/**
+ * Creates a symbolic link asynchronously via io_uring symlinkat.
+ */
+async function symlink(target, linkPath, typeOrOptions) {
+  const type = typeof typeOrOptions === 'string' ? typeOrOptions : undefined;
+  const options = typeof typeOrOptions === 'object' && typeOrOptions !== null ? typeOrOptions : undefined;
+
+  const targetNormalized = normalizePath(target);
+  const linkNormalized = normalizePath(linkPath);
+  const backend = selectExecutionBackend(options);
+
+  if (backend.type === 'provider') {
+    return backend.provider.symlink(targetNormalized, linkNormalized, type);
+  }
+
+  if (backend.type === 'worker') {
+    await getWorkerPool().exec('symlink', [targetNormalized, linkNormalized, type]);
+    return;
+  }
+
+  await native.symlink(targetNormalized, linkNormalized);
+}
+
+/**
+ * Creates a hard link asynchronously via io_uring linkat.
+ */
+async function link(existingPath, newPath, options) {
+  const existingNormalized = normalizePath(existingPath);
+  const newNormalized = normalizePath(newPath);
+  const backend = selectExecutionBackend(options);
+
+  if (backend.type === 'provider') {
+    return backend.provider.link(existingNormalized, newNormalized);
+  }
+
+  if (backend.type === 'worker') {
+    await getWorkerPool().exec('link', [existingNormalized, newNormalized]);
+    return;
+  }
+
+  await native.link(existingNormalized, newNormalized);
+}
+
+/**
+ * Flushes all modified in-core data and metadata of a file to the storage device via io_uring fsync.
+ */
+async function fsync(filePath, options) {
+  const normalized = normalizePath(filePath);
+  const backend = selectExecutionBackend(options);
+
+  if (backend.type === 'provider') {
+    if (typeof backend.provider.fsync === 'function') {
+      return backend.provider.fsync(normalized);
+    }
+    const fh = await fsPromises.open(normalized, 'r');
+    try {
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+    return;
+  }
+
+  if (backend.type === 'worker') {
+    await getWorkerPool().exec('fsync', [normalized, false]);
+    return;
+  }
+
+  await native.fsync(normalized, false);
+}
+
+/**
+ * Flushes all modified in-core file data (excluding non-essential metadata) via io_uring fdatasync.
+ */
+async function fdatasync(filePath, options) {
+  const normalized = normalizePath(filePath);
+  const backend = selectExecutionBackend(options);
+
+  if (backend.type === 'provider') {
+    if (typeof backend.provider.fdatasync === 'function') {
+      return backend.provider.fdatasync(normalized);
+    }
+    const fh = await fsPromises.open(normalized, 'r');
+    try {
+      await fh.datasync();
+    } finally {
+      await fh.close();
+    }
+    return;
+  }
+
+  if (backend.type === 'worker') {
+    await getWorkerPool().exec('fsync', [normalized, true]);
+    return;
+  }
+
+  await native.fsync(normalized, true);
+}
+
 module.exports = {
   readFile,
   writeFile,
   appendFile,
   copyFile,
   stat,
+  lstat,
   unlink,
   mkdir,
+  rename,
+  symlink,
+  link,
+  fsync,
+  fdatasync,
   isUringSupported,
   getActiveBackend,
   getUnsupportedReason,

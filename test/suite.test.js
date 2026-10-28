@@ -58,20 +58,31 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     assert.equal(await uringFs.readFile(filePath, 'utf8'), 'ABCD');
   });
 
-  test('3. Empty files (0 bytes) and large files (8 MB)', async () => {
+  test('3. Empty files (0 bytes), large files (8 MB), and zero-copy kernel splice copyFile', async () => {
     const emptyFile = path.join(tmpDir, 'empty.dat');
+    const emptyCopy = path.join(tmpDir, 'empty_copy.dat');
     await uringFs.writeFile(emptyFile, '');
     const emptyBuf = await uringFs.readFile(emptyFile);
     assert.ok(Buffer.isBuffer(emptyBuf));
     assert.equal(emptyBuf.length, 0);
 
+    await uringFs.copyFile(emptyFile, emptyCopy);
+    const emptyCopyBuf = await uringFs.readFile(emptyCopy);
+    assert.equal(emptyCopyBuf.length, 0);
+
     const largeFile = path.join(tmpDir, 'large_8mb.bin');
+    const largeCopy = path.join(tmpDir, 'large_8mb_copy.bin');
     const largeData = crypto.randomBytes(8 * 1024 * 1024);
     await uringFs.writeFile(largeFile, largeData);
 
-    const readLarge = await uringFs.readFile(largeFile);
+    const fdsBeforeCopy = fs.readdirSync('/proc/self/fd').length;
+    await uringFs.copyFile(largeFile, largeCopy);
+    const fdsAfterCopy = fs.readdirSync('/proc/self/fd').length;
+    assert.equal(fdsAfterCopy, fdsBeforeCopy, 'Zero-copy kernel splice must close all pipe and file descriptors');
+
+    const readLarge = await uringFs.readFile(largeCopy);
     assert.equal(readLarge.length, largeData.length);
-    assert.equal(Buffer.compare(readLarge, largeData), 0, '8 MB payload must match byte-for-byte');
+    assert.equal(Buffer.compare(readLarge, largeData), 0, '8 MB spliced copy must match byte-for-byte');
   });
 
   test('4. appendFile, copyFile, and exclusive write flags (wx / COPYFILE_EXCL)', async () => {
@@ -94,7 +105,7 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
 
     await assert.rejects(
       () => uringFs.copyFile(logFile, copiedFile, uringFs.constants.COPYFILE_EXCL),
-      (err) => err.code === 'EEXIST'
+      (err) => err.code === 'EEXIST' && err.syscall === 'copyfile' && err.dest === copiedFile
     );
   });
 
@@ -122,7 +133,36 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     );
   });
 
-  test('6. Standardized NodeJS.ErrnoException errors (ENOENT, EISDIR)', async () => {
+  test('6. rename, symlink, lstat, link, fsync, fdatasync, and writeFile({ flush: true }) via io_uring', async () => {
+    const origPath = path.join(tmpDir, 'orig_name.txt');
+    const renamedPath = path.join(tmpDir, 'renamed.txt');
+    const symlinkPath = path.join(tmpDir, 'symlink_ref.txt');
+    const hardlinkPath = path.join(tmpDir, 'hardlink_ref.txt');
+
+    await uringFs.writeFile(origPath, 'durable-payload', { flush: true });
+    await uringFs.fsync(origPath);
+    await uringFs.fdatasync(origPath);
+
+    await uringFs.rename(origPath, renamedPath);
+    await assert.rejects(() => uringFs.stat(origPath), (err) => err.code === 'ENOENT');
+    assert.equal(await uringFs.readFile(renamedPath, 'utf8'), 'durable-payload');
+
+    await uringFs.symlink(renamedPath, symlinkPath);
+    const lstatInfo = await uringFs.lstat(symlinkPath);
+    assert.equal(lstatInfo.isSymbolicLink(), true);
+    assert.equal(lstatInfo.isFile(), false);
+
+    const statInfo = await uringFs.stat(symlinkPath);
+    assert.equal(statInfo.isSymbolicLink(), false);
+    assert.equal(statInfo.isFile(), true);
+
+    await uringFs.link(renamedPath, hardlinkPath);
+    const linkedStat = await uringFs.stat(hardlinkPath);
+    assert.equal(linkedStat.nlink, 2);
+    assert.equal(await uringFs.readFile(hardlinkPath, 'utf8'), 'durable-payload');
+  });
+
+  test('7. Standardized NodeJS.ErrnoException errors (ENOENT, EISDIR)', async () => {
     const missingPath = path.join(tmpDir, 'does_not_exist_12345.txt');
 
     await assert.rejects(
@@ -147,7 +187,7 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     );
   });
 
-  test('7. AbortSignal support (pre-aborted)', async () => {
+  test('8. AbortSignal support (pre-aborted)', async () => {
     const sampleFile = path.join(tmpDir, 'abort_sample.txt');
     await uringFs.writeFile(sampleFile, 'data');
 
@@ -159,7 +199,7 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     );
   });
 
-  test('8. High Concurrency (1,000 simultaneous files), Auto-Batching, and Zero FD Leaks', async () => {
+  test('9. High Concurrency (1,000 simultaneous files), Auto-Batching, and Zero FD Leaks', async () => {
     const concurrencyDir = path.join(tmpDir, 'concurrency_1000');
     await uringFs.mkdir(concurrencyDir, { recursive: true });
 
@@ -189,8 +229,8 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     assert.equal(fdsAfter, fdsBefore, `Zero File Descriptor leaks expected (before: ${fdsBefore}, after: ${fdsAfter})`);
   });
 
-  test('9. 3-Tier Fallback System: Custom Provider (memfs/graceful-fs style), Worker Pool, and Strict Mode', async () => {
-    // 9a. Custom Provider (e.g. simulating memfs or graceful-fs)
+  test('10. 3-Tier Fallback System: Custom Provider (memfs/graceful-fs style), Worker Pool, and Strict Mode', async () => {
+    // 10a. Custom Provider (e.g. simulating memfs or graceful-fs)
     const memoryStore = new Map();
     const customMemoryProvider = {
       async writeFile(p, data) {
@@ -220,22 +260,25 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     await uringFs.writeFile('/virtual/mem.txt', 'hello-custom-provider');
     assert.equal(await uringFs.readFile('/virtual/mem.txt', 'utf8'), 'hello-custom-provider');
 
-    // 9b. 'worker' fallback (Dedicated Worker Pool isolated from main libuv thread pool)
+    // 10b. 'worker' fallback (Dedicated Worker Pool isolated from main libuv thread pool)
     uringFs.configure({ forceFallback: true, fallback: 'worker' });
     assert.equal(uringFs.getActiveBackend(), 'worker');
 
     const workerFile = path.join(tmpDir, 'worker_fallback.txt');
+    const workerRenamed = path.join(tmpDir, 'worker_renamed.txt');
     await uringFs.writeFile(workerFile, 'written-by-worker');
-    assert.equal(await uringFs.readFile(workerFile, 'utf8'), 'written-by-worker');
-    const st = await uringFs.stat(workerFile);
+    await uringFs.fsync(workerFile);
+    await uringFs.rename(workerFile, workerRenamed);
+    assert.equal(await uringFs.readFile(workerRenamed, 'utf8'), 'written-by-worker');
+    const st = await uringFs.stat(workerRenamed);
     assert.equal(st.isFile(), true);
     assert.equal(st.size, Buffer.byteLength('written-by-worker'));
 
-    // 9c. Strict Mode (fallback: false)
+    // 10c. Strict Mode (fallback: false)
     uringFs.configure({ forceFallback: true, fallback: false });
     assert.equal(uringFs.getActiveBackend(), 'none');
     await assert.rejects(
-      () => uringFs.readFile(workerFile),
+      () => uringFs.readFile(workerRenamed),
       (err) => err.code === 'ERR_URING_UNSUPPORTED'
     );
 
@@ -244,14 +287,21 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     assert.equal(uringFs.getActiveBackend(), 'io_uring');
   });
 
-  test('10. ES Modules support (import index.mjs)', async () => {
+  test('11. ES Modules support (import index.mjs)', async () => {
     const esmModule = await import('../index.mjs');
     assert.equal(typeof esmModule.readFile, 'function');
     assert.equal(typeof esmModule.writeFile, 'function');
+    assert.equal(typeof esmModule.copyFile, 'function');
+    assert.equal(typeof esmModule.lstat, 'function');
+    assert.equal(typeof esmModule.rename, 'function');
+    assert.equal(typeof esmModule.symlink, 'function');
+    assert.equal(typeof esmModule.link, 'function');
+    assert.equal(typeof esmModule.fsync, 'function');
+    assert.equal(typeof esmModule.fdatasync, 'function');
     assert.equal(esmModule.isUringSupported(), true);
   });
 
-  test('11. Immunity to libuv Thread Pool Starvation', async () => {
+  test('12. Immunity to libuv Thread Pool Starvation', async () => {
     const testFile = path.join(tmpDir, 'starvation.txt');
     await uringFs.writeFile(testFile, 'thread-pool-immune');
 
