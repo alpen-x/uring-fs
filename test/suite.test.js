@@ -25,7 +25,7 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     }
   });
 
-  test('1. Linux Kernel io_uring support detection', () => {
+  test('1. Linux Kernel io_uring support and Direct FD table detection', () => {
     assert.equal(uringFs.isUringSupported(), true, 'io_uring should be active on Linux kernel 6.8+');
     assert.equal(uringFs.getActiveBackend(), 'io_uring');
     assert.equal(uringFs.getUnsupportedReason(), null);
@@ -34,6 +34,8 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     assert.equal(stats.supported, true);
     assert.equal(stats.activeBackend, 'io_uring');
     assert.ok(stats.queueDepth >= 128, `Expected queueDepth >= 128, received: ${stats.queueDepth}`);
+    assert.equal(stats.directFdsSupported, true, 'Direct FD table should be active on Linux 5.19+');
+    assert.equal(stats.directFdTableSize, 1024);
   });
 
   test('2. Write and read UTF-8 text, Buffer, Uint8Array, and file:// URL', async () => {
@@ -226,6 +228,7 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     assert.equal(deltaRequests, count * 2);
     assert.ok(deltaSubmits < deltaSqes / 10, `Batching should reduce syscalls by >90% (SQEs: ${deltaSqes}, Submits: ${deltaSubmits})`);
     assert.equal(statsAfter.activeRequests, 0);
+    assert.equal(statsAfter.directFdsInUse, 0, 'All direct FD slots must be returned to the free list');
     assert.equal(fdsAfter, fdsBefore, `Zero File Descriptor leaks expected (before: ${fdsBefore}, after: ${fdsAfter})`);
   });
 
@@ -298,6 +301,7 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     assert.equal(typeof esmModule.link, 'function');
     assert.equal(typeof esmModule.fsync, 'function');
     assert.equal(typeof esmModule.fdatasync, 'function');
+    assert.equal(typeof esmModule.setOptimisticReadSize, 'function');
     assert.equal(esmModule.isUringSupported(), true);
   });
 
@@ -322,5 +326,76 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     assert.ok(uringTime < 15, `io_uring read must not block on the libuv thread pool (took ${uringTime.toFixed(2)}ms)`);
 
     await Promise.all(cryptoTasks);
+  });
+
+  test('13. Optimistic Read + Direct FD Chaining (Configurable buffer size, boundary conditions, and SQE telemetry)', async () => {
+    const initialStats = uringFs.getRingStats();
+    assert.equal(initialStats.optimisticReadSize, 65536);
+
+    uringFs.configure({ optimisticReadSize: 131072 });
+    assert.equal(uringFs.getRingStats().optimisticReadSize, 131072);
+
+    uringFs.setOptimisticReadSize(65536);
+    assert.equal(uringFs.getRingStats().optimisticReadSize, 65536);
+
+    const boundaryDir = path.join(tmpDir, 'boundaries');
+    await uringFs.mkdir(boundaryDir, { recursive: true });
+
+    const exact64k = crypto.randomBytes(65536);
+    const minusOne64k = crypto.randomBytes(65535);
+    const plusOne64k = crypto.randomBytes(65537);
+    const size128k = crypto.randomBytes(131072);
+
+    const fExact = path.join(boundaryDir, 'exact64k.bin');
+    const fMinus = path.join(boundaryDir, 'minus64k.bin');
+    const fPlus = path.join(boundaryDir, 'plus64k.bin');
+    const f128k = path.join(boundaryDir, 'size128k.bin');
+
+    await uringFs.writeFile(fExact, exact64k);
+    await uringFs.writeFile(fMinus, minusOne64k);
+    await uringFs.writeFile(fPlus, plusOne64k);
+    await uringFs.writeFile(f128k, size128k);
+
+    const readExact = await uringFs.readFile(fExact);
+    assert.equal(readExact.length, 65536);
+    assert.equal(Buffer.compare(readExact, exact64k), 0);
+
+    const readMinus = await uringFs.readFile(fMinus);
+    assert.equal(readMinus.length, 65535);
+    assert.equal(Buffer.compare(readMinus, minusOne64k), 0);
+
+    const readPlus = await uringFs.readFile(fPlus);
+    assert.equal(readPlus.length, 65537);
+    assert.equal(Buffer.compare(readPlus, plusOne64k), 0);
+
+    const read128 = await uringFs.readFile(f128k);
+    assert.equal(read128.length, 131072);
+    assert.equal(Buffer.compare(read128, size128k), 0);
+
+    // Per-call option: optimisticReadSize = 0 (disables optimistic read, forces classic STATX path)
+    const statsBeforeClassic = uringFs.getRingStats();
+    const readClassic = await uringFs.readFile(fExact, { optimisticReadSize: 0 });
+    const statsAfterClassic = uringFs.getRingStats();
+    assert.equal(readClassic.length, 65536);
+    assert.equal(Buffer.compare(readClassic, exact64k), 0);
+    const deltaClassicSqes = statsAfterClassic.totalSqesPrepared - statsBeforeClassic.totalSqesPrepared;
+    assert.equal(deltaClassicSqes, 4, 'Classic read path must execute 4 SQEs: OPEN, STATX, READ, CLOSE');
+
+    // Optimistic path for < 64 KB: linked OPENAT_DIRECT + READ (2 SQEs) + async CLOSE_DIRECT (1 SQE) = 3 SQEs!
+    const statsBeforeOptimistic = uringFs.getRingStats();
+    const readSmallOpt = await uringFs.readFile(fMinus);
+    const statsAfterOptimistic = uringFs.getRingStats();
+    assert.equal(readSmallOpt.length, 65535);
+    const deltaSmallOptSqes = statsAfterOptimistic.totalSqesPrepared - statsBeforeOptimistic.totalSqesPrepared;
+    assert.equal(deltaSmallOptSqes, 3, 'Optimistic read for small file must execute in 3 SQEs');
+
+    // Per-call option: optimisticReadSize = 262144 (256 KB) reads 128 KB in 3 SQEs
+    const statsBeforeLargeOpt = uringFs.getRingStats();
+    const read128kOpt = await uringFs.readFile(f128k, { optimisticReadSize: 262144 });
+    const statsAfterLargeOpt = uringFs.getRingStats();
+    assert.equal(read128kOpt.length, 131072);
+    assert.equal(Buffer.compare(read128kOpt, size128k), 0);
+    const delta128kOptSqes = statsAfterLargeOpt.totalSqesPrepared - statsBeforeLargeOpt.totalSqesPrepared;
+    assert.equal(delta128kOptSqes, 3, 'Optimistic read with 256 KB buffer for 128 KB file must execute in 3 SQEs');
   });
 });

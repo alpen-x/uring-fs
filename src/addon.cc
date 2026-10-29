@@ -15,10 +15,15 @@
 #include <cerrno>
 #include <deque>
 #include <vector>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 #define DEFAULT_QUEUE_DEPTH 512
 #define FALLBACK_QUEUE_DEPTH 128
 #define MAX_SPLICE_CHUNK (1024 * 1024)
+#define DEFAULT_OPTIMISTIC_READ_SIZE (64 * 1024)
+#define DIRECT_FD_TABLE_SIZE 1024
 
 #ifndef SPLICE_F_MOVE
 #define SPLICE_F_MOVE 1
@@ -43,17 +48,96 @@ enum RequestStage {
     STAGE_STATX,
     STAGE_OPEN_DEST,
     STAGE_READ,
+    STAGE_READ_DIRECT_PAIR2,
     STAGE_WRITE,
     STAGE_COPY_SPLICE_IN,
     STAGE_COPY_SPLICE_OUT,
     STAGE_FSYNC,
     STAGE_CLOSE,
+    STAGE_CLOSE_DIRECT,
     STAGE_UNLINK,
     STAGE_MKDIR,
     STAGE_RENAME,
     STAGE_SYMLINK,
     STAGE_LINK
 };
+
+static struct io_uring ring;
+static bool ring_supported = false;
+static bool direct_fds_supported = false;
+static std::vector<int> direct_fd_free_list;
+static size_t default_optimistic_read_size = DEFAULT_OPTIMISTIC_READ_SIZE;
+
+static void InitDirectFdTable() {
+    direct_fd_free_list.clear();
+    if (!ring_supported) {
+        direct_fds_supported = false;
+        return;
+    }
+    int ret = io_uring_register_files_sparse(&ring, DIRECT_FD_TABLE_SIZE);
+    if (ret == 0) {
+        direct_fds_supported = true;
+        direct_fd_free_list.reserve(DIRECT_FD_TABLE_SIZE);
+        for (int i = DIRECT_FD_TABLE_SIZE - 1; i >= 0; --i) {
+            direct_fd_free_list.push_back(i);
+        }
+    } else {
+        direct_fds_supported = false;
+    }
+}
+
+static int AllocateDirectSlot() {
+    if (!direct_fds_supported || direct_fd_free_list.empty()) {
+        return -1;
+    }
+    int slot = direct_fd_free_list.back();
+    direct_fd_free_list.pop_back();
+    return slot;
+}
+
+static void FreeDirectSlot(int slot) {
+    if (slot >= 0 && slot < DIRECT_FD_TABLE_SIZE) {
+        direct_fd_free_list.push_back(slot);
+    }
+}
+
+static constexpr size_t MAX_POOLED_BUFFERS = 256;
+static std::vector<char*> optimistic_buffer_pool;
+static size_t pooled_buffer_size = 0;
+
+static void ClearOptimisticBufferPool() {
+    for (char* buf : optimistic_buffer_pool) {
+        std::free(buf);
+    }
+    optimistic_buffer_pool.clear();
+}
+
+static char* AcquireReadBuffer(size_t size) {
+    if (size > 0 && size == default_optimistic_read_size) {
+        if (pooled_buffer_size != default_optimistic_read_size) {
+            ClearOptimisticBufferPool();
+            pooled_buffer_size = default_optimistic_read_size;
+        }
+        if (!optimistic_buffer_pool.empty()) {
+            char* buf = optimistic_buffer_pool.back();
+            optimistic_buffer_pool.pop_back();
+            return buf;
+        }
+    }
+    return static_cast<char*>(std::malloc(size));
+}
+
+static void ReleaseReadBuffer(char* buf, size_t capacity) {
+    if (!buf) return;
+    if (capacity > 0 &&
+        capacity == default_optimistic_read_size &&
+        pooled_buffer_size == default_optimistic_read_size &&
+        optimistic_buffer_pool.size() < MAX_POOLED_BUFFERS) {
+        optimistic_buffer_pool.push_back(buf);
+    } else {
+        std::free(buf);
+    }
+}
 
 struct IORequest {
     Napi::Env env;
@@ -72,7 +156,17 @@ struct IORequest {
     bool flush_after_write;
     mode_t mode;
 
+    int direct_slot;
+    bool is_linked_chain;
+    uint32_t pending_linked_cqes;
+    int linked_stage_index;
+    bool open_succeeded;
+
+    bool optimistic_read;
+    size_t optimistic_read_size;
+
     char* buffer;
+    size_t buffer_capacity;
     const char* write_ptr;
     std::string write_str_holder;
     Napi::ObjectReference write_buf_ref;
@@ -99,7 +193,15 @@ struct IORequest {
           fsync_flags(0),
           flush_after_write(false),
           mode(0666),
+          direct_slot(-1),
+          is_linked_chain(false),
+          pending_linked_cqes(0),
+          linked_stage_index(0),
+          open_succeeded(false),
+          optimistic_read(false),
+          optimistic_read_size(0),
           buffer(nullptr),
+          buffer_capacity(0),
           write_ptr(nullptr),
           size(0),
           offset(0),
@@ -115,9 +217,14 @@ struct IORequest {
     }
 
     ~IORequest() {
+        if (direct_slot >= 0) {
+            FreeDirectSlot(direct_slot);
+            direct_slot = -1;
+        }
         if (buffer) {
-            std::free(buffer);
+            ReleaseReadBuffer(buffer, buffer_capacity);
             buffer = nullptr;
+            buffer_capacity = 0;
         }
         if (pipefd[0] >= 0) {
             close(pipefd[0]);
@@ -144,13 +251,11 @@ struct RingStats {
     uint32_t queue_depth = 0;
 };
 
-static struct io_uring ring;
 static uv_poll_t poll_handle;
 static uv_prepare_t prepare_handle;
 static uv_check_t check_handle;
 static napi_async_context async_context = nullptr;
 
-static bool ring_supported = false;
 static bool handles_initialized = false;
 static bool poll_refd = false;
 static bool flush_hooks_active = false;
@@ -165,6 +270,7 @@ static uint32_t in_flight_sqes = 0;
 static uint32_t unsubmitted_sqes = 0;
 
 static std::deque<IORequest*> pending_queue;
+static std::deque<IORequest*> pending_pair2_queue;
 static RingStats stats;
 
 static void OnPollReadable(uv_poll_t* handle, int status, int events);
@@ -226,15 +332,24 @@ static void PrepSqeForRequest(struct io_uring_sqe* sqe, IORequest* req) {
                 io_uring_prep_statx(sqe, AT_FDCWD, req->path.c_str(), 0, STATX_BASIC_STATS | STATX_BTIME, &req->stx);
             } else if (req->op == OP_LSTAT) {
                 io_uring_prep_statx(sqe, AT_FDCWD, req->path.c_str(), AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS | STATX_BTIME, &req->stx);
+            } else if (req->direct_slot >= 0) {
+                io_uring_prep_statx(sqe, AT_FDCWD, req->path.c_str(), 0, STATX_SIZE | STATX_MODE, &req->stx);
             } else {
                 io_uring_prep_statx(sqe, req->fd, "", AT_EMPTY_PATH, STATX_SIZE | STATX_MODE, &req->stx);
             }
             break;
         case STAGE_READ: {
             size_t remaining = req->size - req->offset;
-            io_uring_prep_read(sqe, req->fd, req->buffer + req->offset, remaining, req->offset);
+            if (req->direct_slot >= 0) {
+                io_uring_prep_read(sqe, req->direct_slot, req->buffer + req->offset, remaining, req->offset);
+                sqe->flags |= IOSQE_FIXED_FILE;
+            } else {
+                io_uring_prep_read(sqe, req->fd, req->buffer + req->offset, remaining, req->offset);
+            }
             break;
         }
+        case STAGE_READ_DIRECT_PAIR2:
+            break;
         case STAGE_WRITE: {
             size_t remaining = req->size - req->offset;
             uint64_t write_offset = (req->open_flags & O_APPEND) ? static_cast<uint64_t>(-1) : req->offset;
@@ -265,6 +380,9 @@ static void PrepSqeForRequest(struct io_uring_sqe* sqe, IORequest* req) {
             break;
         case STAGE_CLOSE:
             io_uring_prep_close(sqe, req->fd);
+            break;
+        case STAGE_CLOSE_DIRECT:
+            io_uring_prep_close_direct(sqe, static_cast<unsigned>(req->direct_slot));
             break;
         case STAGE_UNLINK:
             io_uring_prep_unlinkat(sqe, AT_FDCWD, req->path.c_str(), 0);
@@ -337,6 +455,28 @@ static void EnqueueAsyncClose(int fd) {
     }
 }
 
+// Fire-and-forget close for a direct descriptor slot.
+// Encodes `(slot << 1) | 1ULL` in CQE user_data so the slot is returned to the free list
+// only after the kernel confirms the direct descriptor is closed.
+static void EnqueueAsyncCloseDirect(int slot) {
+    if (slot < 0) return;
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+    if (!sqe && unsubmitted_sqes > 0) {
+        FlushSubmissions();
+        sqe = io_uring_get_sqe(&ring);
+    }
+    if (sqe) {
+        io_uring_prep_close_direct(sqe, static_cast<unsigned>(slot));
+        uint64_t tagged_slot = (static_cast<uint64_t>(static_cast<uint32_t>(slot)) << 1) | 1ULL;
+        io_uring_sqe_set_data64(sqe, tagged_slot);
+        unsubmitted_sqes++;
+        in_flight_sqes++;
+        stats.total_sqes_prepared++;
+    } else {
+        FreeDirectSlot(slot);
+    }
+}
+
 static void CloseCopyPipes(IORequest* req) {
     if (req->pipefd[0] >= 0) {
         close(req->pipefd[0]);
@@ -348,17 +488,307 @@ static void CloseCopyPipes(IORequest* req) {
     }
 }
 
-static void ScheduleStage(IORequest* req) {
-    if (pending_queue.empty()) {
-        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-        if (!sqe && unsubmitted_sqes > 0) {
-            FlushSubmissions();
-            sqe = io_uring_get_sqe(&ring);
+static bool TryScheduleLinkedWrite(IORequest* req) {
+    if (!direct_fds_supported) return false;
+
+    uint32_t needed = 3;
+    if (req->size == 0) {
+        needed = req->flush_after_write ? 3 : 2;
+    } else {
+        needed = req->flush_after_write ? 4 : 3;
+    }
+
+    if (in_flight_sqes + needed > stats.queue_depth) {
+        return false;
+    }
+    if (io_uring_sq_space_left(&ring) < needed && unsubmitted_sqes > 0) {
+        FlushSubmissions();
+    }
+    if (io_uring_sq_space_left(&ring) < needed) {
+        return false;
+    }
+
+    int slot = AllocateDirectSlot();
+    if (slot < 0) {
+        return false;
+    }
+
+    req->direct_slot = slot;
+    req->is_linked_chain = true;
+    req->pending_linked_cqes = needed;
+    req->linked_stage_index = 0;
+    req->open_succeeded = false;
+
+    int open_flags = req->open_flags & ~O_CLOEXEC;
+    uint64_t write_offset = (req->open_flags & O_APPEND) ? static_cast<uint64_t>(-1) : 0;
+
+    if (req->size == 0) {
+        if (!req->flush_after_write) {
+            struct io_uring_sqe* sqe0 = io_uring_get_sqe(&ring);
+            io_uring_prep_openat_direct(sqe0, AT_FDCWD, req->path.c_str(), open_flags, req->mode, slot);
+            sqe0->flags |= IOSQE_IO_LINK;
+            io_uring_sqe_set_data(sqe0, req);
+
+            struct io_uring_sqe* sqe1 = io_uring_get_sqe(&ring);
+            io_uring_prep_close_direct(sqe1, slot);
+            io_uring_sqe_set_data(sqe1, req);
+        } else {
+            struct io_uring_sqe* sqe0 = io_uring_get_sqe(&ring);
+            io_uring_prep_openat_direct(sqe0, AT_FDCWD, req->path.c_str(), open_flags, req->mode, slot);
+            sqe0->flags |= IOSQE_IO_LINK;
+            io_uring_sqe_set_data(sqe0, req);
+
+            struct io_uring_sqe* sqe1 = io_uring_get_sqe(&ring);
+            io_uring_prep_fsync(sqe1, slot, req->fsync_flags);
+            sqe1->flags |= IOSQE_FIXED_FILE | IOSQE_IO_LINK;
+            io_uring_sqe_set_data(sqe1, req);
+
+            struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
+            io_uring_prep_close_direct(sqe2, slot);
+            io_uring_sqe_set_data(sqe2, req);
         }
-        if (sqe) {
-            PrepSqeForRequest(sqe, req);
-            StartFlushHooks();
+    } else {
+        if (!req->flush_after_write) {
+            struct io_uring_sqe* sqe0 = io_uring_get_sqe(&ring);
+            io_uring_prep_openat_direct(sqe0, AT_FDCWD, req->path.c_str(), open_flags, req->mode, slot);
+            sqe0->flags |= IOSQE_IO_LINK;
+            io_uring_sqe_set_data(sqe0, req);
+
+            struct io_uring_sqe* sqe1 = io_uring_get_sqe(&ring);
+            io_uring_prep_write(sqe1, slot, req->write_ptr, req->size, write_offset);
+            sqe1->flags |= IOSQE_FIXED_FILE | IOSQE_IO_LINK;
+            io_uring_sqe_set_data(sqe1, req);
+
+            struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
+            io_uring_prep_close_direct(sqe2, slot);
+            io_uring_sqe_set_data(sqe2, req);
+        } else {
+            struct io_uring_sqe* sqe0 = io_uring_get_sqe(&ring);
+            io_uring_prep_openat_direct(sqe0, AT_FDCWD, req->path.c_str(), open_flags, req->mode, slot);
+            sqe0->flags |= IOSQE_IO_LINK;
+            io_uring_sqe_set_data(sqe0, req);
+
+            struct io_uring_sqe* sqe1 = io_uring_get_sqe(&ring);
+            io_uring_prep_write(sqe1, slot, req->write_ptr, req->size, write_offset);
+            sqe1->flags |= IOSQE_FIXED_FILE | IOSQE_IO_LINK;
+            io_uring_sqe_set_data(sqe1, req);
+
+            struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
+            io_uring_prep_fsync(sqe2, slot, req->fsync_flags);
+            sqe2->flags |= IOSQE_FIXED_FILE | IOSQE_IO_LINK;
+            io_uring_sqe_set_data(sqe2, req);
+
+            struct io_uring_sqe* sqe3 = io_uring_get_sqe(&ring);
+            io_uring_prep_close_direct(sqe3, slot);
+            io_uring_sqe_set_data(sqe3, req);
+        }
+    }
+
+    unsubmitted_sqes += needed;
+    in_flight_sqes += needed;
+    stats.total_sqes_prepared += needed;
+    StartFlushHooks();
+    return true;
+}
+
+static bool TryScheduleLinkedFsync(IORequest* req) {
+    if (!direct_fds_supported) return false;
+
+    uint32_t needed = 3;
+    if (in_flight_sqes + needed > stats.queue_depth) {
+        return false;
+    }
+    if (io_uring_sq_space_left(&ring) < needed && unsubmitted_sqes > 0) {
+        FlushSubmissions();
+    }
+    if (io_uring_sq_space_left(&ring) < needed) {
+        return false;
+    }
+
+    int slot = AllocateDirectSlot();
+    if (slot < 0) {
+        return false;
+    }
+
+    req->direct_slot = slot;
+    req->is_linked_chain = true;
+    req->pending_linked_cqes = needed;
+    req->linked_stage_index = 0;
+    req->open_succeeded = false;
+
+    int open_flags = req->open_flags & ~O_CLOEXEC;
+
+    struct io_uring_sqe* sqe0 = io_uring_get_sqe(&ring);
+    io_uring_prep_openat_direct(sqe0, AT_FDCWD, req->path.c_str(), open_flags, req->mode, slot);
+    sqe0->flags |= IOSQE_IO_LINK;
+    io_uring_sqe_set_data(sqe0, req);
+
+    struct io_uring_sqe* sqe1 = io_uring_get_sqe(&ring);
+    io_uring_prep_fsync(sqe1, slot, req->fsync_flags);
+    sqe1->flags |= IOSQE_FIXED_FILE | IOSQE_IO_LINK;
+    io_uring_sqe_set_data(sqe1, req);
+
+    struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
+    io_uring_prep_close_direct(sqe2, slot);
+    io_uring_sqe_set_data(sqe2, req);
+
+    unsubmitted_sqes += needed;
+    in_flight_sqes += needed;
+    stats.total_sqes_prepared += needed;
+    StartFlushHooks();
+    return true;
+}
+
+// Unified Optimization #1 + #2:
+// - When optimistic_read_size > 0: links OPENAT_DIRECT(slot) -> READ(slot, optimistic_read_size) in a single submission!
+//   If the file fits in optimistic_read_size, the entire read completes in 1 kernel roundtrip and STATX is skipped.
+// - When optimistic_read_size == 0: links OPENAT_DIRECT(slot) -> STATX(path) in Pair 1, followed by READ(slot) -> CLOSE_DIRECT(slot) in Pair 2.
+static bool TryScheduleLinkedReadPair1(IORequest* req) {
+    if (!direct_fds_supported) return false;
+
+    uint32_t needed = 2;
+    if (in_flight_sqes + needed > stats.queue_depth) {
+        return false;
+    }
+    if (io_uring_sq_space_left(&ring) < needed && unsubmitted_sqes > 0) {
+        FlushSubmissions();
+    }
+    if (io_uring_sq_space_left(&ring) < needed) {
+        return false;
+    }
+
+    int slot = AllocateDirectSlot();
+    if (slot < 0) {
+        return false;
+    }
+
+    if (req->optimistic_read_size > 0) {
+        req->buffer = AcquireReadBuffer(req->optimistic_read_size);
+        if (!req->buffer) {
+            FreeDirectSlot(slot);
+            return false;
+        }
+        req->buffer_capacity = req->optimistic_read_size;
+        req->size = req->optimistic_read_size;
+        req->offset = 0;
+        req->optimistic_read = true;
+    }
+
+    req->direct_slot = slot;
+    req->is_linked_chain = true;
+    req->pending_linked_cqes = needed;
+    req->linked_stage_index = 0;
+    req->open_succeeded = false;
+
+    int open_flags = req->open_flags & ~O_CLOEXEC;
+
+    struct io_uring_sqe* sqe0 = io_uring_get_sqe(&ring);
+    io_uring_prep_openat_direct(sqe0, AT_FDCWD, req->path.c_str(), open_flags, req->mode, slot);
+    sqe0->flags |= IOSQE_IO_LINK;
+    io_uring_sqe_set_data(sqe0, req);
+
+    struct io_uring_sqe* sqe1 = io_uring_get_sqe(&ring);
+    if (req->optimistic_read) {
+        io_uring_prep_read(sqe1, slot, req->buffer, req->optimistic_read_size, 0);
+        sqe1->flags |= IOSQE_FIXED_FILE;
+    } else {
+        io_uring_prep_statx(sqe1, AT_FDCWD, req->path.c_str(), 0, STATX_SIZE | STATX_MODE, &req->stx);
+    }
+    io_uring_sqe_set_data(sqe1, req);
+
+    unsubmitted_sqes += needed;
+    in_flight_sqes += needed;
+    stats.total_sqes_prepared += needed;
+    StartFlushHooks();
+    return true;
+}
+
+static bool TryScheduleLinkedReadPair2(IORequest* req) {
+    uint32_t needed = 2;
+    if (in_flight_sqes + needed > stats.queue_depth) {
+        return false;
+    }
+    if (io_uring_sq_space_left(&ring) < needed && unsubmitted_sqes > 0) {
+        FlushSubmissions();
+    }
+    if (io_uring_sq_space_left(&ring) < needed) {
+        return false;
+    }
+
+    req->is_linked_chain = true;
+    req->pending_linked_cqes = needed;
+    req->linked_stage_index = 0;
+
+    size_t remaining = req->size - req->offset;
+
+    struct io_uring_sqe* sqe0 = io_uring_get_sqe(&ring);
+    io_uring_prep_read(sqe0, req->direct_slot, req->buffer + req->offset, remaining, req->offset);
+    sqe0->flags |= IOSQE_FIXED_FILE | IOSQE_IO_LINK;
+    io_uring_sqe_set_data(sqe0, req);
+
+    struct io_uring_sqe* sqe1 = io_uring_get_sqe(&ring);
+    io_uring_prep_close_direct(sqe1, req->direct_slot);
+    io_uring_sqe_set_data(sqe1, req);
+
+    unsubmitted_sqes += needed;
+    in_flight_sqes += needed;
+    stats.total_sqes_prepared += needed;
+    StartFlushHooks();
+    return true;
+}
+
+static void ScheduleStage(IORequest* req) {
+    if (req->stage == STAGE_READ_DIRECT_PAIR2) {
+        if (pending_pair2_queue.empty() && TryScheduleLinkedReadPair2(req)) {
             return;
+        }
+        pending_pair2_queue.push_back(req);
+        stats.overflow_queued++;
+        StartFlushHooks();
+        return;
+    }
+
+    if (req->stage == STAGE_CLOSE_DIRECT || (req->stage == STAGE_STATX && req->direct_slot >= 0)) {
+        if (pending_pair2_queue.empty() && in_flight_sqes + 1 <= stats.queue_depth) {
+            struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+            if (!sqe && unsubmitted_sqes > 0) {
+                FlushSubmissions();
+                sqe = io_uring_get_sqe(&ring);
+            }
+            if (sqe) {
+                PrepSqeForRequest(sqe, req);
+                StartFlushHooks();
+                return;
+            }
+        }
+        pending_pair2_queue.push_back(req);
+        stats.overflow_queued++;
+        StartFlushHooks();
+        return;
+    }
+
+    if (pending_queue.empty()) {
+        if (req->stage == STAGE_OPEN) {
+            if (req->op == OP_WRITE_FILE) {
+                if (TryScheduleLinkedWrite(req)) return;
+            } else if (req->op == OP_FSYNC) {
+                if (TryScheduleLinkedFsync(req)) return;
+            } else if (req->op == OP_READ_FILE) {
+                if (TryScheduleLinkedReadPair1(req)) return;
+            }
+        }
+
+        if (in_flight_sqes + 1 <= stats.queue_depth) {
+            struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+            if (!sqe && unsubmitted_sqes > 0) {
+                FlushSubmissions();
+                sqe = io_uring_get_sqe(&ring);
+            }
+            if (sqe) {
+                PrepSqeForRequest(sqe, req);
+                StartFlushHooks();
+                return;
+            }
         }
     }
 
@@ -368,7 +798,70 @@ static void ScheduleStage(IORequest* req) {
 }
 
 static void DrainPendingQueue() {
+    // 1. Prioritize draining pair2 and close_direct requests to complete reads and free direct slots
+    while (!pending_pair2_queue.empty()) {
+        IORequest* req = pending_pair2_queue.front();
+        if (req->stage == STAGE_READ_DIRECT_PAIR2) {
+            if (TryScheduleLinkedReadPair2(req)) {
+                pending_pair2_queue.pop_front();
+                continue;
+            }
+            break;
+        } else if (req->stage == STAGE_CLOSE_DIRECT || (req->stage == STAGE_STATX && req->direct_slot >= 0)) {
+            if (in_flight_sqes + 1 > stats.queue_depth) {
+                break;
+            }
+            struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+            if (!sqe && unsubmitted_sqes > 0) {
+                FlushSubmissions();
+                sqe = io_uring_get_sqe(&ring);
+            }
+            if (!sqe) {
+                break;
+            }
+            pending_pair2_queue.pop_front();
+            PrepSqeForRequest(sqe, req);
+            continue;
+        } else {
+            pending_pair2_queue.pop_front();
+        }
+    }
+
+    // 2. Drain new requests from pending_queue
     while (!pending_queue.empty()) {
+        IORequest* req = pending_queue.front();
+
+        if (req->stage == STAGE_OPEN) {
+            if (req->op == OP_WRITE_FILE) {
+                if (TryScheduleLinkedWrite(req)) {
+                    pending_queue.pop_front();
+                    continue;
+                }
+                if (direct_fds_supported) {
+                    break;
+                }
+            } else if (req->op == OP_FSYNC) {
+                if (TryScheduleLinkedFsync(req)) {
+                    pending_queue.pop_front();
+                    continue;
+                }
+                if (direct_fds_supported) {
+                    break;
+                }
+            } else if (req->op == OP_READ_FILE) {
+                if (TryScheduleLinkedReadPair1(req)) {
+                    pending_queue.pop_front();
+                    continue;
+                }
+                if (direct_fds_supported) {
+                    break;
+                }
+            }
+        }
+
+        if (in_flight_sqes + 1 > stats.queue_depth) {
+            break;
+        }
         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
         if (!sqe) {
             if (unsubmitted_sqes > 0) {
@@ -379,7 +872,6 @@ static void DrainPendingQueue() {
                 break;
             }
         }
-        IORequest* req = pending_queue.front();
         pending_queue.pop_front();
         PrepSqeForRequest(sqe, req);
     }
@@ -439,7 +931,6 @@ static bool EnsureCredentialsSafe(Napi::Env env) {
     }
 
     if (active_requests > 0 || in_flight_sqes > 0) {
-        // Reject if credentials changed while I/O requests are still in flight
         return false;
     }
 
@@ -449,9 +940,13 @@ static bool EnsureCredentialsSafe(Napi::Env env) {
     int ret = InitRingWithBestFlags(stats.queue_depth, &ring);
     if (ret < 0) {
         ring_supported = false;
+        direct_fds_supported = false;
+        direct_fd_free_list.clear();
         unsupported_reason = std::string("Failed to reinitialize io_uring after UID/GID change: ") + std::strerror(-ret);
         return false;
     }
+
+    InitDirectFdTable();
 
     ring_euid = cur_uid;
     ring_egid = cur_gid;
@@ -470,7 +965,7 @@ static bool EnsureCredentialsSafe(Napi::Env env) {
 static void OnPrepareFlush(uv_prepare_t* handle) {
     DrainPendingQueue();
     FlushSubmissions();
-    if (pending_queue.empty() && unsubmitted_sqes == 0) {
+    if (pending_queue.empty() && pending_pair2_queue.empty() && unsubmitted_sqes == 0) {
         StopFlushHooks();
     }
 }
@@ -478,7 +973,7 @@ static void OnPrepareFlush(uv_prepare_t* handle) {
 static void OnCheckFlush(uv_check_t* handle) {
     DrainPendingQueue();
     FlushSubmissions();
-    if (pending_queue.empty() && unsubmitted_sqes == 0) {
+    if (pending_queue.empty() && pending_pair2_queue.empty() && unsubmitted_sqes == 0) {
         StopFlushHooks();
     }
 }
@@ -522,7 +1017,7 @@ static void ProcessCompletions() {
     finished_requests.reserve(128);
     int passes = 0;
 
-    // Reap multiple stages that complete immediately in memory (e.g. OPEN -> STATX -> READ/SPLICE -> CLOSE)
+    // Reap multiple stages that complete immediately in memory
     // without returning to epoll_wait between stages when the kernel responds synchronously.
     while (io_uring_cq_ready(&ring) > 0 && passes < 64) {
         passes++;
@@ -537,12 +1032,295 @@ static void ProcessCompletions() {
             }
             stats.total_cqes_reaped++;
 
-            IORequest* req = reinterpret_cast<IORequest*>(io_uring_cqe_get_data(cqe));
-            if (!req) {
+            uint64_t raw_data = io_uring_cqe_get_data64(cqe);
+            if (raw_data == 0) {
+                continue;
+            }
+            if (raw_data & 1ULL) {
+                int closed_slot = static_cast<int>(raw_data >> 1);
+                FreeDirectSlot(closed_slot);
                 continue;
             }
 
+            IORequest* req = reinterpret_cast<IORequest*>(static_cast<uintptr_t>(raw_data));
             int res = cqe->res;
+
+            if (req->is_linked_chain) {
+                int cqe_idx = req->linked_stage_index++;
+                req->pending_linked_cqes--;
+
+                if (req->op == OP_WRITE_FILE) {
+                    if (req->size == 0) {
+                        if (!req->flush_after_write) {
+                            if (cqe_idx == 0) {
+                                if (res < 0) {
+                                    req->saved_errno = -res;
+                                    req->failed_syscall = "open";
+                                } else {
+                                    req->open_succeeded = true;
+                                }
+                            } else if (cqe_idx == 1) {
+                                if (res < 0 && req->saved_errno == 0 && -res != ECANCELED) {
+                                    req->saved_errno = -res;
+                                    req->failed_syscall = "close";
+                                }
+                            }
+                        } else {
+                            if (cqe_idx == 0) {
+                                if (res < 0) {
+                                    req->saved_errno = -res;
+                                    req->failed_syscall = "open";
+                                } else {
+                                    req->open_succeeded = true;
+                                }
+                            } else if (cqe_idx == 1) {
+                                if (res < 0 && req->saved_errno == 0 && -res != ECANCELED) {
+                                    req->saved_errno = -res;
+                                    req->failed_syscall = (req->fsync_flags & IORING_FSYNC_DATASYNC) ? "fdatasync" : "fsync";
+                                }
+                            } else if (cqe_idx == 2) {
+                                if (res < 0 && req->saved_errno == 0 && -res != ECANCELED) {
+                                    req->saved_errno = -res;
+                                    req->failed_syscall = "close";
+                                }
+                            }
+                        }
+                    } else {
+                        if (!req->flush_after_write) {
+                            if (cqe_idx == 0) {
+                                if (res < 0) {
+                                    req->saved_errno = -res;
+                                    req->failed_syscall = "open";
+                                } else {
+                                    req->open_succeeded = true;
+                                }
+                            } else if (cqe_idx == 1) {
+                                if (res < 0) {
+                                    if (req->saved_errno == 0 && -res != ECANCELED) {
+                                        req->saved_errno = -res;
+                                        req->failed_syscall = "write";
+                                    }
+                                } else {
+                                    req->offset += static_cast<size_t>(res);
+                                }
+                            } else if (cqe_idx == 2) {
+                                if (res < 0 && req->saved_errno == 0 && -res != ECANCELED) {
+                                    req->saved_errno = -res;
+                                    req->failed_syscall = "close";
+                                }
+                            }
+                        } else {
+                            if (cqe_idx == 0) {
+                                if (res < 0) {
+                                    req->saved_errno = -res;
+                                    req->failed_syscall = "open";
+                                } else {
+                                    req->open_succeeded = true;
+                                }
+                            } else if (cqe_idx == 1) {
+                                if (res < 0) {
+                                    if (req->saved_errno == 0 && -res != ECANCELED) {
+                                        req->saved_errno = -res;
+                                        req->failed_syscall = "write";
+                                    }
+                                } else {
+                                    req->offset += static_cast<size_t>(res);
+                                }
+                            } else if (cqe_idx == 2) {
+                                if (res < 0 && req->saved_errno == 0 && -res != ECANCELED) {
+                                    req->saved_errno = -res;
+                                    req->failed_syscall = (req->fsync_flags & IORING_FSYNC_DATASYNC) ? "fdatasync" : "fsync";
+                                }
+                            } else if (cqe_idx == 3) {
+                                if (res < 0 && req->saved_errno == 0 && -res != ECANCELED) {
+                                    req->saved_errno = -res;
+                                    req->failed_syscall = "close";
+                                }
+                            }
+                        }
+                    }
+
+                    if (req->pending_linked_cqes == 0) {
+                        req->is_linked_chain = false;
+                        if (req->open_succeeded && -res == ECANCELED) {
+                            req->stage = STAGE_CLOSE_DIRECT;
+                            ScheduleStage(req);
+                        } else {
+                            FreeDirectSlot(req->direct_slot);
+                            req->direct_slot = -1;
+                            finished_requests.push_back(req);
+                        }
+                    }
+                    continue;
+                }
+
+                if (req->op == OP_FSYNC) {
+                    if (cqe_idx == 0) {
+                        if (res < 0) {
+                            req->saved_errno = -res;
+                            req->failed_syscall = "open";
+                        } else {
+                            req->open_succeeded = true;
+                        }
+                    } else if (cqe_idx == 1) {
+                        if (res < 0 && req->saved_errno == 0 && -res != ECANCELED) {
+                            req->saved_errno = -res;
+                            req->failed_syscall = (req->fsync_flags & IORING_FSYNC_DATASYNC) ? "fdatasync" : "fsync";
+                        }
+                    } else if (cqe_idx == 2) {
+                        if (res < 0 && req->saved_errno == 0 && -res != ECANCELED) {
+                            req->saved_errno = -res;
+                            req->failed_syscall = "close";
+                        }
+                    }
+
+                    if (req->pending_linked_cqes == 0) {
+                        req->is_linked_chain = false;
+                        if (req->open_succeeded && -res == ECANCELED) {
+                            req->stage = STAGE_CLOSE_DIRECT;
+                            ScheduleStage(req);
+                        } else {
+                            FreeDirectSlot(req->direct_slot);
+                            req->direct_slot = -1;
+                            finished_requests.push_back(req);
+                        }
+                    }
+                    continue;
+                }
+
+                if (req->op == OP_READ_FILE) {
+                    if (req->optimistic_read) {
+                        // Unified Pair 1 (Optimistic): 0: openat_direct, 1: read(optimistic_read_size)
+                        if (cqe_idx == 0) {
+                            if (res < 0) {
+                                req->saved_errno = -res;
+                                req->failed_syscall = "open";
+                            } else {
+                                req->open_succeeded = true;
+                            }
+                        } else if (cqe_idx == 1) {
+                            if (res < 0) {
+                                if (req->saved_errno == 0 && -res != ECANCELED) {
+                                    req->saved_errno = -res;
+                                    req->failed_syscall = "read";
+                                }
+                            } else {
+                                req->offset = static_cast<size_t>(res);
+                            }
+                        }
+
+                        if (req->pending_linked_cqes == 0) {
+                            req->is_linked_chain = false;
+                            req->optimistic_read = false;
+
+                            if (!req->open_succeeded) {
+                                FreeDirectSlot(req->direct_slot);
+                                req->direct_slot = -1;
+                                finished_requests.push_back(req);
+                            } else if (req->saved_errno != 0) {
+                                EnqueueAsyncCloseDirect(req->direct_slot);
+                                req->direct_slot = -1;
+                                finished_requests.push_back(req);
+                            } else if (req->offset < req->optimistic_read_size) {
+                                // Entire file read in 1 single linked submission!
+                                req->size = req->offset;
+                                EnqueueAsyncCloseDirect(req->direct_slot);
+                                req->direct_slot = -1;
+                                finished_requests.push_back(req);
+                            } else {
+                                // File is >= optimistic_read_size: query total size via STATX
+                                req->stage = STAGE_STATX;
+                                ScheduleStage(req);
+                            }
+                        }
+                    } else if (req->stage == STAGE_OPEN) {
+                        // Classic Pair 1 (optimistic_read_size == 0): 0: openat_direct, 1: statx
+                        if (cqe_idx == 0) {
+                            if (res < 0) {
+                                req->saved_errno = -res;
+                                req->failed_syscall = "open";
+                            } else {
+                                req->open_succeeded = true;
+                            }
+                        } else if (cqe_idx == 1) {
+                            if (res < 0 && req->saved_errno == 0 && -res != ECANCELED) {
+                                req->saved_errno = -res;
+                                req->failed_syscall = "stat";
+                            }
+                        }
+
+                        if (req->pending_linked_cqes == 0) {
+                            req->is_linked_chain = false;
+                            if (!req->open_succeeded || req->saved_errno != 0) {
+                                if (req->open_succeeded) {
+                                    EnqueueAsyncCloseDirect(req->direct_slot);
+                                    req->direct_slot = -1;
+                                } else {
+                                    FreeDirectSlot(req->direct_slot);
+                                    req->direct_slot = -1;
+                                }
+                                finished_requests.push_back(req);
+                            } else if (S_ISDIR(req->stx.stx_mode)) {
+                                req->saved_errno = EISDIR;
+                                req->failed_syscall = "read";
+                                EnqueueAsyncCloseDirect(req->direct_slot);
+                                req->direct_slot = -1;
+                                finished_requests.push_back(req);
+                            } else if (req->stx.stx_size == 0) {
+                                req->size = 0;
+                                EnqueueAsyncCloseDirect(req->direct_slot);
+                                req->direct_slot = -1;
+                                finished_requests.push_back(req);
+                            } else {
+                                req->size = static_cast<size_t>(req->stx.stx_size);
+                                req->buffer = static_cast<char*>(std::malloc(req->size));
+                                if (!req->buffer) {
+                                    req->saved_errno = ENOMEM;
+                                    req->failed_syscall = "read";
+                                    EnqueueAsyncCloseDirect(req->direct_slot);
+                                    req->direct_slot = -1;
+                                    finished_requests.push_back(req);
+                                } else {
+                                    req->offset = 0;
+                                    req->stage = STAGE_READ_DIRECT_PAIR2;
+                                    ScheduleStage(req);
+                                }
+                            }
+                        }
+                    } else {
+                        // Pair 2: 0: read(remainder), 1: close_direct
+                        if (cqe_idx == 0) {
+                            if (res < 0) {
+                                if (req->saved_errno == 0 && -res != ECANCELED) {
+                                    req->saved_errno = -res;
+                                    req->failed_syscall = "read";
+                                }
+                            } else {
+                                req->offset += static_cast<size_t>(res);
+                                req->size = req->offset;
+                            }
+                        } else if (cqe_idx == 1) {
+                            if (res < 0 && req->saved_errno == 0 && -res != ECANCELED) {
+                                req->saved_errno = -res;
+                                req->failed_syscall = "close";
+                            }
+                        }
+
+                        if (req->pending_linked_cqes == 0) {
+                            req->is_linked_chain = false;
+                            if (res < 0 && -res == ECANCELED) {
+                                req->stage = STAGE_CLOSE_DIRECT;
+                                ScheduleStage(req);
+                            } else {
+                                FreeDirectSlot(req->direct_slot);
+                                req->direct_slot = -1;
+                                finished_requests.push_back(req);
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
 
             switch (req->stage) {
                 case STAGE_OPEN: {
@@ -552,7 +1330,28 @@ static void ProcessCompletions() {
                         finished_requests.push_back(req);
                     } else {
                         req->fd = res;
-                        if (req->op == OP_READ_FILE || req->op == OP_COPY_FILE) {
+                        if (req->op == OP_READ_FILE) {
+                            if (req->optimistic_read_size > 0) {
+                                req->buffer = AcquireReadBuffer(req->optimistic_read_size);
+                                if (!req->buffer) {
+                                    req->saved_errno = ENOMEM;
+                                    req->failed_syscall = "read";
+                                    EnqueueAsyncClose(req->fd);
+                                    req->fd = -1;
+                                    finished_requests.push_back(req);
+                                } else {
+                                    req->buffer_capacity = req->optimistic_read_size;
+                                    req->size = req->optimistic_read_size;
+                                    req->offset = 0;
+                                    req->optimistic_read = true;
+                                    req->stage = STAGE_READ;
+                                    ScheduleStage(req);
+                                }
+                            } else {
+                                req->stage = STAGE_STATX;
+                                ScheduleStage(req);
+                            }
+                        } else if (req->op == OP_COPY_FILE) {
                             req->stage = STAGE_STATX;
                             ScheduleStage(req);
                         } else if (req->op == OP_FSYNC) {
@@ -603,19 +1402,66 @@ static void ProcessCompletions() {
                         break;
                     }
 
-                    // OP_READ_FILE statx completion
+                    // OP_READ_FILE statx completion (either after optimistic read overflow or classic fallback)
                     if (res < 0) {
                         req->saved_errno = -res;
                         req->failed_syscall = "fstat";
-                        EnqueueAsyncClose(req->fd);
-                        req->fd = -1;
+                        if (req->direct_slot >= 0) {
+                            EnqueueAsyncCloseDirect(req->direct_slot);
+                            req->direct_slot = -1;
+                        } else {
+                            EnqueueAsyncClose(req->fd);
+                            req->fd = -1;
+                        }
                         finished_requests.push_back(req);
                     } else if (S_ISDIR(req->stx.stx_mode)) {
                         req->saved_errno = EISDIR;
                         req->failed_syscall = "read";
-                        EnqueueAsyncClose(req->fd);
-                        req->fd = -1;
+                        if (req->direct_slot >= 0) {
+                            EnqueueAsyncCloseDirect(req->direct_slot);
+                            req->direct_slot = -1;
+                        } else {
+                            EnqueueAsyncClose(req->fd);
+                            req->fd = -1;
+                        }
                         finished_requests.push_back(req);
+                    } else if (req->buffer != nullptr && req->offset > 0) {
+                        size_t total_size = static_cast<size_t>(req->stx.stx_size);
+                        if (total_size <= req->offset) {
+                            req->size = req->offset;
+                            if (req->direct_slot >= 0) {
+                                EnqueueAsyncCloseDirect(req->direct_slot);
+                                req->direct_slot = -1;
+                            } else {
+                                EnqueueAsyncClose(req->fd);
+                                req->fd = -1;
+                            }
+                            finished_requests.push_back(req);
+                        } else {
+                            char* new_buf = static_cast<char*>(std::realloc(req->buffer, total_size));
+                            if (!new_buf) {
+                                req->saved_errno = ENOMEM;
+                                req->failed_syscall = "read";
+                                if (req->direct_slot >= 0) {
+                                    EnqueueAsyncCloseDirect(req->direct_slot);
+                                    req->direct_slot = -1;
+                                } else {
+                                    EnqueueAsyncClose(req->fd);
+                                    req->fd = -1;
+                                }
+                                finished_requests.push_back(req);
+                            } else {
+                                req->buffer = new_buf;
+                                req->buffer_capacity = total_size;
+                                req->size = total_size;
+                                if (req->direct_slot >= 0) {
+                                    req->stage = STAGE_READ_DIRECT_PAIR2;
+                                } else {
+                                    req->stage = STAGE_READ;
+                                }
+                                ScheduleStage(req);
+                            }
+                        }
                     } else {
                         req->size = static_cast<size_t>(req->stx.stx_size);
                         if (req->size == 0) {
@@ -657,7 +1503,6 @@ static void ProcessCompletions() {
                             ScheduleStage(req);
                         } else if (pipe2(req->pipefd, O_CLOEXEC) == 0) {
                             if (req->size > 65536) {
-                                // Best-effort increase of kernel pipe capacity up to 1 MB
                                 fcntl(req->pipefd[1], F_SETPIPE_SZ, MAX_SPLICE_CHUNK);
                             }
                             req->offset = 0;
@@ -666,7 +1511,6 @@ static void ProcessCompletions() {
                             req->stage = STAGE_COPY_SPLICE_IN;
                             ScheduleStage(req);
                         } else {
-                            // Fallback to buffered copy if pipe creation fails (e.g., EMFILE)
                             req->buffer = static_cast<char*>(std::malloc(req->size));
                             if (!req->buffer) {
                                 req->saved_errno = ENOMEM;
@@ -691,7 +1535,6 @@ static void ProcessCompletions() {
                         if (-res == EINTR || -res == EAGAIN) {
                             ScheduleStage(req);
                         } else if ((-res == EINVAL || -res == ENOSYS) && req->offset == 0) {
-                            // Filesystem does not support splice: seamlessly fall back to buffered read/write
                             CloseCopyPipes(req);
                             req->buffer = static_cast<char*>(std::malloc(req->size));
                             if (!req->buffer) {
@@ -717,7 +1560,6 @@ static void ProcessCompletions() {
                             finished_requests.push_back(req);
                         }
                     } else if (res == 0) {
-                        // Early EOF on source file
                         CloseCopyPipes(req);
                         EnqueueAsyncClose(req->fd);
                         req->fd = req->dest_fd;
@@ -767,6 +1609,9 @@ static void ProcessCompletions() {
                     break;
                 }
 
+                case STAGE_READ_DIRECT_PAIR2:
+                    break;
+
                 case STAGE_READ: {
                     if (res < 0) {
                         if (-res == EINTR || -res == EAGAIN) {
@@ -774,16 +1619,33 @@ static void ProcessCompletions() {
                         } else {
                             req->saved_errno = -res;
                             req->failed_syscall = (req->op == OP_COPY_FILE) ? "copyfile" : "read";
-                            EnqueueAsyncClose(req->fd);
+                            if (req->direct_slot >= 0) {
+                                EnqueueAsyncCloseDirect(req->direct_slot);
+                                req->direct_slot = -1;
+                            } else {
+                                EnqueueAsyncClose(req->fd);
+                                req->fd = -1;
+                            }
                             if (req->dest_fd >= 0) {
                                 EnqueueAsyncClose(req->dest_fd);
                                 req->dest_fd = -1;
                             }
-                            req->fd = -1;
                             finished_requests.push_back(req);
                         }
+                    } else if (req->optimistic_read) {
+                        req->offset += static_cast<size_t>(res);
+                        if (static_cast<size_t>(res) < req->optimistic_read_size) {
+                            req->size = req->offset;
+                            req->optimistic_read = false;
+                            EnqueueAsyncClose(req->fd);
+                            req->fd = -1;
+                            finished_requests.push_back(req);
+                        } else {
+                            req->optimistic_read = false;
+                            req->stage = STAGE_STATX;
+                            ScheduleStage(req);
+                        }
                     } else if (res == 0) {
-                        // EOF reached before expected size
                         req->size = req->offset;
                         EnqueueAsyncClose(req->fd);
                         req->fd = -1;
@@ -798,7 +1660,6 @@ static void ProcessCompletions() {
                     } else {
                         req->offset += static_cast<size_t>(res);
                         if (req->offset < req->size) {
-                            // Short read: schedule remaining bytes
                             ScheduleStage(req);
                         } else {
                             EnqueueAsyncClose(req->fd);
@@ -833,7 +1694,6 @@ static void ProcessCompletions() {
                     } else {
                         req->offset += static_cast<size_t>(res);
                         if (req->offset < req->size) {
-                            // Short write: schedule remaining bytes
                             ScheduleStage(req);
                         } else {
                             if (req->op == OP_COPY_FILE) {
@@ -863,6 +1723,17 @@ static void ProcessCompletions() {
                         req->saved_errno = -res;
                         req->failed_syscall = "close";
                     }
+                    finished_requests.push_back(req);
+                    break;
+                }
+
+                case STAGE_CLOSE_DIRECT: {
+                    if (res < 0 && req->saved_errno == 0) {
+                        req->saved_errno = -res;
+                        req->failed_syscall = "close";
+                    }
+                    FreeDirectSlot(req->direct_slot);
+                    req->direct_slot = -1;
                     finished_requests.push_back(req);
                     break;
                 }
@@ -923,8 +1794,6 @@ static void ProcessCompletions() {
     }
 
     // Resolve or reject all completed Promises inside a Napi::CallbackScope.
-    // The CallbackScope ensures V8 immediately drains microtasks (.then / await continuations)
-    // upon exiting this block across all Node.js versions (including Node 24 and 26).
     if (!finished_requests.empty()) {
         Napi::Env cb_env = finished_requests[0]->env;
         Napi::HandleScope handle_scope(cb_env);
@@ -940,10 +1809,20 @@ static void ProcessCompletions() {
                     case OP_READ_FILE: {
                         if (req->size == 0 || !req->buffer) {
                             req->deferred.Resolve(Napi::Buffer<char>::New(req->env, 0));
+                        } else if (req->size <= 16384 && req->buffer_capacity > 0 && req->buffer_capacity == default_optimistic_read_size) {
+                            Napi::Buffer<char> out = Napi::Buffer<char>::Copy(req->env, req->buffer, req->size);
+                            req->deferred.Resolve(out);
                         } else {
                             char* raw_buf = req->buffer;
                             size_t len = req->size;
+                            if (req->buffer_capacity > len) {
+                                char* shrunk = static_cast<char*>(std::realloc(raw_buf, len));
+                                if (shrunk) {
+                                    raw_buf = shrunk;
+                                }
+                            }
                             req->buffer = nullptr; // Transfer ownership to V8 GC (zero-copy)
+                            req->buffer_capacity = 0;
                             Napi::Buffer<char> out = Napi::Buffer<char>::New(
                                 req->env,
                                 raw_buf,
@@ -983,11 +1862,10 @@ static void ProcessCompletions() {
         }
     }
 
-    // Flush any new operations that were synchronously queued by .then() / await microtasks above
     DrainPendingQueue();
     FlushSubmissions();
 
-    if (pending_queue.empty() && unsubmitted_sqes == 0) {
+    if (pending_queue.empty() && pending_pair2_queue.empty() && unsubmitted_sqes == 0) {
         StopFlushHooks();
     } else {
         StartFlushHooks();
@@ -1013,8 +1891,15 @@ Napi::Value ReadFileUring(const Napi::CallbackInfo& info) {
     }
 
     std::string filePath = info[0].As<Napi::String>().Utf8Value();
+    size_t optimisticSize = default_optimistic_read_size;
+    if (info.Length() >= 2 && info[1].IsNumber()) {
+        int64_t val = info[1].As<Napi::Number>().Int64Value();
+        optimisticSize = val <= 0 ? 0 : static_cast<size_t>(val);
+    }
+
     IORequest* req = new IORequest(env, OP_READ_FILE, STAGE_OPEN, filePath);
     req->open_flags = O_RDONLY;
+    req->optimistic_read_size = optimisticSize;
     Napi::Promise promise = req->deferred.Promise();
 
     if (!EnsureCredentialsSafe(env)) {
@@ -1029,6 +1914,17 @@ Napi::Value ReadFileUring(const Napi::CallbackInfo& info) {
     ScheduleStage(req);
 
     return promise;
+}
+
+Napi::Value SetOptimisticReadSize(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsNumber()) {
+        Napi::TypeError::New(env, "Expected a non-negative number of bytes").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    int64_t val = info[0].As<Napi::Number>().Int64Value();
+    default_optimistic_read_size = val <= 0 ? 0 : static_cast<size_t>(val);
+    return Napi::Number::New(env, static_cast<double>(default_optimistic_read_size));
 }
 
 Napi::Value WriteFileUring(const Napi::CallbackInfo& info) {
@@ -1368,7 +2264,7 @@ Napi::Value GetRingStats(const Napi::CallbackInfo& info) {
     obj.Set("queueDepth", Napi::Number::New(env, stats.queue_depth));
     obj.Set("activeRequests", Napi::Number::New(env, static_cast<double>(active_requests)));
     obj.Set("inFlightSqes", Napi::Number::New(env, in_flight_sqes));
-    obj.Set("pendingOverflowQueue", Napi::Number::New(env, static_cast<double>(pending_queue.size())));
+    obj.Set("pendingOverflowQueue", Napi::Number::New(env, static_cast<double>(pending_queue.size() + pending_pair2_queue.size())));
     obj.Set("totalRequests", Napi::Number::New(env, static_cast<double>(stats.total_requests)));
     obj.Set("totalSqesPrepared", Napi::Number::New(env, static_cast<double>(stats.total_sqes_prepared)));
     obj.Set("totalSubmitSyscalls", Napi::Number::New(env, static_cast<double>(stats.total_submit_syscalls)));
@@ -1376,6 +2272,10 @@ Napi::Value GetRingStats(const Napi::CallbackInfo& info) {
     obj.Set("peakInFlight", Napi::Number::New(env, static_cast<double>(stats.peak_in_flight)));
     obj.Set("overflowQueued", Napi::Number::New(env, static_cast<double>(stats.overflow_queued)));
     obj.Set("credentialResets", Napi::Number::New(env, static_cast<double>(stats.credential_resets)));
+    obj.Set("optimisticReadSize", Napi::Number::New(env, static_cast<double>(default_optimistic_read_size)));
+    obj.Set("directFdsSupported", Napi::Boolean::New(env, direct_fds_supported));
+    obj.Set("directFdTableSize", Napi::Number::New(env, DIRECT_FD_TABLE_SIZE));
+    obj.Set("directFdsInUse", Napi::Number::New(env, direct_fds_supported ? (DIRECT_FD_TABLE_SIZE - direct_fd_free_list.size()) : 0));
     return obj;
 }
 
@@ -1388,6 +2288,9 @@ static void CleanupModule(void* arg) {
         uv_close(reinterpret_cast<uv_handle_t*>(&poll_handle), nullptr);
         handles_initialized = false;
     }
+    ClearOptimisticBufferPool();
+    direct_fd_free_list.clear();
+    direct_fds_supported = false;
     if (ring_supported) {
         io_uring_queue_exit(&ring);
         ring_supported = false;
@@ -1396,6 +2299,9 @@ static void CleanupModule(void* arg) {
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     if (!handles_initialized && !ring_supported && unsupported_reason.empty()) {
+#ifdef __GLIBC__
+        mallopt(M_MMAP_THRESHOLD, 4 * 1024 * 1024);
+#endif
         uint32_t depth = DEFAULT_QUEUE_DEPTH;
         int ret = InitRingWithBestFlags(depth, &ring);
         if (ret < 0) {
@@ -1411,6 +2317,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
             stats.queue_depth = depth;
             ring_euid = geteuid();
             ring_egid = getegid();
+
+            InitDirectFdTable();
 
             uv_loop_t* loop;
             napi_get_uv_event_loop(env, &loop);
@@ -1435,6 +2343,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     }
 
     exports.Set("readFile", Napi::Function::New(env, ReadFileUring));
+    exports.Set("setOptimisticReadSize", Napi::Function::New(env, SetOptimisticReadSize));
     exports.Set("writeFile", Napi::Function::New(env, WriteFileUring));
     exports.Set("copyFile", Napi::Function::New(env, CopyFileUring));
     exports.Set("stat", Napi::Function::New(env, StatUring));

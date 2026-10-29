@@ -41,6 +41,11 @@ export interface UringCommonOptions {
 export interface UringReadOptions extends UringCommonOptions {
   encoding?: BufferEncoding | null;
   signal?: AbortSignal;
+  /**
+   * Size of the initial optimistic read buffer in bytes (default: 65536).
+   * Setting to 0 disables optimistic read and queries file size via statx first.
+   */
+  optimisticReadSize?: number;
 }
 
 export interface UringWriteOptions extends UringCommonOptions {
@@ -80,6 +85,11 @@ export interface UringFsConfig {
    * Number of worker threads for `fallback: 'worker'` mode (default: 2).
    */
   workerPoolSize?: number;
+  /**
+   * Default size of the initial optimistic read buffer in bytes (default: 65536).
+   * Setting to 0 disables optimistic read globally.
+   */
+  optimisticReadSize?: number;
 }
 
 export interface RingStats {
@@ -96,6 +106,10 @@ export interface RingStats {
   peakInFlight: number;
   overflowQueued: number;
   credentialResets: number;
+  optimisticReadSize: number;
+  directFdsSupported: boolean;
+  directFdTableSize: number;
+  directFdsInUse: number;
   syscallsSavedByBatching: number;
 }
 
@@ -124,11 +138,11 @@ export class UringStats {
 
 export function readFile(
   path: PathLike,
-  options?: { encoding?: null; signal?: AbortSignal; strict?: boolean; fallback?: FallbackStrategy } | null
+  options?: { encoding?: null; signal?: AbortSignal; strict?: boolean; fallback?: FallbackStrategy; optimisticReadSize?: number } | null
 ): Promise<Buffer>;
 export function readFile(
   path: PathLike,
-  options: BufferEncoding | { encoding: BufferEncoding; signal?: AbortSignal; strict?: boolean; fallback?: FallbackStrategy }
+  options: BufferEncoding | { encoding: BufferEncoding; signal?: AbortSignal; strict?: boolean; fallback?: FallbackStrategy; optimisticReadSize?: number }
 ): Promise<string>;
 export function readFile(
   path: PathLike,
@@ -194,6 +208,8 @@ export function configure(options?: UringFsConfig): {
   fallback: 'fs' | 'worker' | 'custom' | false;
   forceFallback: boolean;
   workerPoolSize: number;
+  optimisticReadSize: number;
 };
+export function setOptimisticReadSize(bytes: number): number;
 export function closeFallbackWorkers(): Promise<void>;
 export const constants: typeof import('node:fs').constants;

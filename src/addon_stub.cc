@@ -18,9 +18,18 @@ Napi::Value GetUnsupportedReason(const Napi::CallbackInfo& info) {
 #endif
 }
 
+Napi::Value SetOptimisticReadSize(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsNumber()) {
+        return Napi::Number::New(env, 65536);
+    }
+    return info[0];
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("isSupported", Napi::Function::New(env, IsSupported));
     exports.Set("getUnsupportedReason", Napi::Function::New(env, GetUnsupportedReason));
+    exports.Set("setOptimisticReadSize", Napi::Function::New(env, SetOptimisticReadSize));
     return exports;
 }
 

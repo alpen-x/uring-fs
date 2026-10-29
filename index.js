@@ -19,6 +19,7 @@ const config = {
   fallback: 'fs', // 'fs' | 'worker' | CustomProvider | false | true
   forceFallback: false,
   workerPoolSize: 2,
+  optimisticReadSize: 64 * 1024,
 };
 
 let workerPool = null;
@@ -48,7 +49,7 @@ function resolveCustomProvider(provider) {
 
 /**
  * Configures global behavior of uring-fs.
- * @param {{ fallback?: 'fs' | 'worker' | boolean | object, forceFallback?: boolean, workerPoolSize?: number }} options
+ * @param {{ fallback?: 'fs' | 'worker' | boolean | object, forceFallback?: boolean, workerPoolSize?: number, optimisticReadSize?: number }} options
  */
 function configure(options = {}) {
   if (options.fallback !== undefined) {
@@ -76,11 +77,37 @@ function configure(options = {}) {
     config.workerPoolSize = Math.floor(options.workerPoolSize);
   }
 
+  if (typeof options.optimisticReadSize === 'number') {
+    const size = Math.max(0, Math.floor(options.optimisticReadSize));
+    config.optimisticReadSize = size;
+    if (native && typeof native.setOptimisticReadSize === 'function') {
+      native.setOptimisticReadSize(size);
+    }
+  }
+
   return {
     fallback: typeof config.fallback === 'object' ? 'custom' : config.fallback,
     forceFallback: config.forceFallback,
     workerPoolSize: config.workerPoolSize,
+    optimisticReadSize: config.optimisticReadSize,
   };
+}
+
+/**
+ * Sets the default optimistic read buffer size in bytes (default: 65536).
+ * Setting to 0 disables optimistic read globally.
+ * @param {number} bytes
+ */
+function setOptimisticReadSize(bytes) {
+  if (typeof bytes !== 'number' || bytes < 0) {
+    throw new TypeError('The "bytes" argument must be a non-negative number.');
+  }
+  const size = Math.floor(bytes);
+  config.optimisticReadSize = size;
+  if (native && typeof native.setOptimisticReadSize === 'function') {
+    native.setOptimisticReadSize(size);
+  }
+  return size;
 }
 
 /**
@@ -157,6 +184,10 @@ function getRingStats() {
       peakInFlight: 0,
       overflowQueued: 0,
       credentialResets: 0,
+      optimisticReadSize: config.optimisticReadSize,
+      directFdsSupported: false,
+      directFdTableSize: 0,
+      directFdsInUse: 0,
       syscallsSavedByBatching: 0,
     };
   }
@@ -316,12 +347,16 @@ class UringStats {
 async function readFile(filePath, options) {
   let encoding = null;
   let signal = undefined;
+  let optimisticReadSize = undefined;
 
   if (typeof options === 'string') {
     encoding = options;
   } else if (options && typeof options === 'object') {
     encoding = options.encoding ?? null;
     signal = options.signal;
+    if (typeof options.optimisticReadSize === 'number') {
+      optimisticReadSize = Math.max(0, Math.floor(options.optimisticReadSize));
+    }
   }
 
   if (signal && signal.aborted) {
@@ -340,7 +375,9 @@ async function readFile(filePath, options) {
     return wrapWithAbortSignal(workerPromise, signal);
   }
 
-  const rawPromise = native.readFile(normalized);
+  const rawPromise = optimisticReadSize !== undefined
+    ? native.readFile(normalized, optimisticReadSize)
+    : native.readFile(normalized);
   const buffer = await wrapWithAbortSignal(rawPromise, signal);
 
   if (encoding) {
@@ -695,6 +732,7 @@ module.exports = {
   getUnsupportedReason,
   getRingStats,
   configure,
+  setOptimisticReadSize,
   closeFallbackWorkers,
   UringStats,
   constants: fsConstants,

@@ -19,6 +19,7 @@ export const {
   getUnsupportedReason,
   getRingStats,
   configure,
+  setOptimisticReadSize,
   closeFallbackWorkers,
   UringStats,
   constants,
