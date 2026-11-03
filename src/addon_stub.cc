@@ -21,9 +21,12 @@ Napi::Value GetUnsupportedReason(const Napi::CallbackInfo& info) {
 Napi::Value SetOptimisticReadSize(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 1 || !info[0].IsNumber()) {
-        return Napi::Number::New(env, 65536);
+        Napi::TypeError::New(env, "Expected a non-negative number of bytes").ThrowAsJavaScriptException();
+        return env.Null();
     }
-    return info[0];
+    int64_t val = info[0].As<Napi::Number>().Int64Value();
+    size_t clamped = val <= 0 ? 0 : static_cast<size_t>(val);
+    return Napi::Number::New(env, static_cast<double>(clamped));
 }
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {

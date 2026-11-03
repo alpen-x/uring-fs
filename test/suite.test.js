@@ -398,4 +398,227 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     const delta128kOptSqes = statsAfterLargeOpt.totalSqesPrepared - statsBeforeLargeOpt.totalSqesPrepared;
     assert.equal(delta128kOptSqes, 3, 'Optimistic read with 256 KB buffer for 128 KB file must execute in 3 SQEs');
   });
+
+  test('14. 1-SQE access and exists via STATX (F_OK, R_OK, W_OK, X_OK, and fallbacks)', async () => {
+    const accessFile = path.join(tmpDir, 'access_test.txt');
+    const missingFile = path.join(tmpDir, 'does_not_exist_access.txt');
+    await uringFs.writeFile(accessFile, 'access-check-payload');
+
+    const statsBefore = uringFs.getRingStats();
+    await uringFs.access(accessFile, uringFs.constants.F_OK);
+    const statsAfter = uringFs.getRingStats();
+    assert.equal(
+      statsAfter.totalSqesPrepared - statsBefore.totalSqesPrepared,
+      1,
+      'access() must execute in exactly 1 STATX SQE'
+    );
+
+    await uringFs.access(accessFile, uringFs.constants.R_OK | uringFs.constants.W_OK);
+    assert.equal(await uringFs.exists(accessFile), true);
+    assert.equal(await uringFs.exists(missingFile), false);
+
+    await assert.rejects(
+      async () => {
+        await uringFs.access(missingFile);
+      },
+      { code: 'ENOENT', syscall: 'access' }
+    );
+
+    // Non-executable regular file must reject X_OK when not root
+    if (process.geteuid && process.geteuid() !== 0) {
+      await assert.rejects(
+        async () => {
+          await uringFs.access(accessFile, uringFs.constants.X_OK);
+        },
+        { code: 'EACCES', syscall: 'access' }
+      );
+    }
+
+    // Worker fallback test for access/exists
+    assert.equal(await uringFs.exists(accessFile, { fallback: 'worker' }), true);
+    assert.equal(await uringFs.exists(missingFile, { fallback: 'worker' }), false);
+    await uringFs.closeFallbackWorkers();
+  });
+
+  test('15. Strict Node.js fs/promises parity (mkdir recursive return, DataView, error codes, UringStats predicates, constants)', async () => {
+    // 1. Top-level constants export parity
+    assert.equal(uringFs.F_OK, fs.constants.F_OK);
+    assert.equal(uringFs.R_OK, fs.constants.R_OK);
+    assert.equal(uringFs.W_OK, fs.constants.W_OK);
+    assert.equal(uringFs.X_OK, fs.constants.X_OK);
+    assert.equal(uringFs.COPYFILE_EXCL, fs.constants.COPYFILE_EXCL);
+
+    // 2. mkdir({ recursive: true }) returns the first created directory path (matching node:fs/promises)
+    const firstDir = path.join(tmpDir, 'rec_first');
+    const nestedDir = path.join(firstDir, 'second', 'third');
+    const createdPath = await uringFs.mkdir(nestedDir, { recursive: true });
+    assert.equal(createdPath, path.resolve(firstDir));
+    const alreadyExistsReturn = await uringFs.mkdir(nestedDir, { recursive: true });
+    assert.equal(alreadyExistsReturn, undefined);
+
+    // 3. Per-call { fallback: false } and { fallback: 'none' } must succeed when io_uring is supported
+    if (uringFs.isUringSupported()) {
+      assert.equal(await uringFs.exists(firstDir, { fallback: false }), true);
+      assert.equal(await uringFs.exists(firstDir, { fallback: 'none' }), true);
+    }
+
+    // 4. DataView support in writeFile and appendFile across backends
+    const dvFile = path.join(tmpDir, 'dataview.bin');
+    const rawAb = new Uint8Array([10, 20, 30, 40, 50, 60]).buffer;
+    const dvSlice = new DataView(rawAb, 1, 4); // [20, 30, 40, 50]
+    await uringFs.writeFile(dvFile, dvSlice);
+    await uringFs.appendFile(dvFile, dvSlice);
+    const dvRead = await uringFs.readFile(dvFile);
+    assert.deepEqual(Array.from(dvRead), [20, 30, 40, 50, 20, 30, 40, 50]);
+
+    // 5. UringStats POSIX type predicates and dev/rdev properties
+    const st = await uringFs.stat(dvFile);
+    assert.equal(typeof st.dev, 'number');
+    assert.equal(typeof st.rdev, 'number');
+    assert.equal(st.isFile(), true);
+    assert.equal(st.isDirectory(), false);
+    assert.equal(st.isSymbolicLink(), false);
+    assert.equal(st.isBlockDevice(), false);
+    assert.equal(st.isCharacterDevice(), false);
+    assert.equal(st.isFIFO(), false);
+    assert.equal(st.isSocket(), false);
+
+    // 6. Standard Node.js error codes for invalid arguments
+    await assert.rejects(
+      async () => {
+        await uringFs.exists(null);
+      },
+      { name: 'TypeError', code: 'ERR_INVALID_ARG_TYPE' }
+    );
+    await assert.rejects(
+      async () => {
+        await uringFs.readFile(12345);
+      },
+      { name: 'TypeError', code: 'ERR_INVALID_ARG_TYPE' }
+    );
+    await assert.rejects(
+      async () => {
+        await uringFs.access(dvFile, 999);
+      },
+      { name: 'RangeError', code: 'ERR_OUT_OF_RANGE' }
+    );
+    await assert.rejects(
+      async () => {
+        await uringFs.readFile(dvFile, 'invalid_encoding_xyz');
+      },
+      { name: 'TypeError', code: 'ERR_INVALID_ARG_VALUE' }
+    );
+    assert.throws(
+      () => {
+        uringFs.setOptimisticReadSize(NaN);
+      },
+      { name: 'TypeError', code: 'ERR_INVALID_ARG_VALUE' }
+    );
+    assert.throws(
+      () => {
+        uringFs.setOptimisticReadSize(Infinity);
+      },
+      { name: 'TypeError', code: 'ERR_INVALID_ARG_VALUE' }
+    );
+  });
+
+  test('16. DedicatedWorkerPool crash recovery (ERR_WORKER_EXITED) and mid-flight termination (ERR_WORKER_TERMINATED)', async () => {
+    const { DedicatedWorkerPool } = require('../lib/worker_fallback');
+    const crashTestFile = path.join(tmpDir, 'worker_crash_test.txt');
+    await uringFs.writeFile(crashTestFile, 'worker-recovery-payload');
+
+    const pool = new DedicatedWorkerPool(2);
+    try {
+      // Warm up the pool (uses workers[0]) and verify normal operation
+      const initialRead = await pool.exec('readFile', [crashTestFile, 'utf8'], 'utf8');
+      assert.equal(initialRead, 'worker-recovery-payload');
+      assert.equal(pool.workers.length, 2);
+
+      // 1. Simulate an abrupt worker crash while a request is in-flight on workers[1]:
+      const inFlightCrashPromise = pool.exec('readFile', [crashTestFile, 'utf8'], 'utf8');
+      const crashRejection = assert.rejects(inFlightCrashPromise, {
+        code: 'ERR_WORKER_EXITED',
+      });
+      pool.workers[1].worker.terminate();
+      await crashRejection;
+      assert.equal(pool.workers.length, 0, 'Pool must clear dead workers after an unexpected crash');
+
+      // Verify automatic pool respawn on the very next call
+      const recoveredRead = await pool.exec('readFile', [crashTestFile, 'utf8'], 'utf8');
+      assert.equal(recoveredRead, 'worker-recovery-payload');
+      assert.equal(pool.workers.length, 2, 'Pool must automatically respawn workers on next exec()');
+
+      // 2. Mid-flight pool.terminate() must reject pending promises with ERR_WORKER_TERMINATED instead of hanging
+      const inFlightTermPromise = pool.exec('readFile', [crashTestFile, 'utf8'], 'utf8');
+      const termRejection = assert.rejects(inFlightTermPromise, {
+        code: 'ERR_WORKER_TERMINATED',
+      });
+      await pool.terminate();
+      await termRejection;
+      assert.equal(pool.workers.length, 0);
+    } finally {
+      await pool.terminate();
+    }
+
+    // Verify top-level closeFallbackWorkers() mid-flight and recovery
+    const topLevelPromise = uringFs.readFile(crashTestFile, { encoding: 'utf8', fallback: 'worker' });
+    const topLevelRejection = assert.rejects(topLevelPromise, {
+      code: 'ERR_WORKER_TERMINATED',
+    });
+    await uringFs.closeFallbackWorkers();
+    await topLevelRejection;
+
+    const topLevelRecovered = await uringFs.readFile(crashTestFile, { encoding: 'utf8', fallback: 'worker' });
+    assert.equal(topLevelRecovered, 'worker-recovery-payload');
+    await uringFs.closeFallbackWorkers();
+  });
+
+  test('17. Concurrent appendFile atomicity, record integrity, and ordering under Promise.all (200 concurrent writes)', async () => {
+    const appendLogFile = path.join(tmpDir, 'concurrent_append.jsonl');
+    await uringFs.writeFile(appendLogFile, '');
+
+    const totalRecords = 200;
+    const expectedLines = [];
+    for (let i = 0; i < totalRecords; i++) {
+      const payload = JSON.stringify({
+        seq: i,
+        tag: `record-${String(i).padStart(4, '0')}`,
+        data: 'X'.repeat(256),
+      }) + '\n';
+      expectedLines.push(payload);
+    }
+
+    const expectedTotalBytes = expectedLines.reduce((sum, l) => sum + Buffer.byteLength(l), 0);
+
+    // Fire all 200 appendFile operations simultaneously via Promise.all
+    await Promise.all(expectedLines.map((line) => uringFs.appendFile(appendLogFile, line)));
+
+    const rawContent = await uringFs.readFile(appendLogFile, 'utf8');
+    assert.equal(
+      Buffer.byteLength(rawContent),
+      expectedTotalBytes,
+      'Total file size must equal exact sum of all 200 concurrent appended records (zero lost or truncated bytes)'
+    );
+
+    const lines = rawContent.trim().split('\n');
+    assert.equal(lines.length, totalRecords, 'Must contain exactly 200 newline-delimited records');
+
+    const seenSeqs = new Set();
+    let inOrderTransitions = 0;
+    let prevSeq = -1;
+
+    for (const line of lines) {
+      // Every line must be valid, uncorrupted JSON (no interleaving of bytes between concurrent O_APPEND writes)
+      const parsed = JSON.parse(line);
+      assert.equal(parsed.tag, `record-${String(parsed.seq).padStart(4, '0')}`);
+      assert.equal(parsed.data, 'X'.repeat(256));
+      seenSeqs.add(parsed.seq);
+      if (parsed.seq === prevSeq + 1) {
+        inOrderTransitions++;
+      }
+      prevSeq = parsed.seq;
+    }
+
+    assert.equal(seenSeqs.size, totalRecords, 'All 200 unique records (0..199) must be present without duplicates or drops');
+  });
 });

@@ -79,6 +79,8 @@ import {
   copyFile,
   stat,
   lstat,
+  access,
+  exists,
   mkdir,
   rename,
   symlink,
@@ -129,6 +131,8 @@ await unlink('hello.txt');
 | `copyFile(src, dest, mode?)` | `OPENAT` ➔ `STATX` ➔ `SPLICE` ➔ `CLOSE` | Zero-copy kernel-to-kernel copy via `io_uring_prep_splice` |
 | `stat(path, options?)` | `STATX` (`0`) | Retrieves `UringStats` (follows symlinks) |
 | `lstat(path, options?)` | `STATX` (`AT_SYMLINK_NOFOLLOW`) | Retrieves `UringStats` without following symlinks |
+| `access(path, mode?, options?)` | `STATX` *(1-SQE)* | Checks file existence (`F_OK`) and permissions (`R_OK`, `W_OK`, `X_OK`) without opening an FD |
+| `exists(path, options?)` | `STATX` *(1-SQE)* | Returns `Promise<boolean>` indicating whether the path exists |
 | `rename(oldPath, newPath, options?)` | `RENAMEAT` | Atomically renames/moves a file or directory |
 | `symlink(target, path, options?)` | `SYMLINKAT` | Creates a symbolic link |
 | `link(existingPath, newPath, options?)` | `LINKAT` | Creates a hard link |

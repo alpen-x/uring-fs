@@ -7,6 +7,8 @@ export const {
   copyFile,
   stat,
   lstat,
+  access,
+  exists,
   unlink,
   mkdir,
   rename,
@@ -23,6 +25,11 @@ export const {
   closeFallbackWorkers,
   UringStats,
   constants,
+  F_OK,
+  R_OK,
+  W_OK,
+  X_OK,
+  COPYFILE_EXCL,
 } = cjsModule;
 
 export default cjsModule;

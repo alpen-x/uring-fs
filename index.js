@@ -22,6 +22,19 @@ const config = {
   optimisticReadSize: 64 * 1024,
 };
 
+if (process.env.URING_FS_FALLBACK) {
+  const envFallback = process.env.URING_FS_FALLBACK.trim().toLowerCase();
+  if (envFallback === 'native' || envFallback === 'fs') {
+    config.forceFallback = true;
+    config.fallback = 'fs';
+  } else if (envFallback === 'worker') {
+    config.forceFallback = true;
+    config.fallback = 'worker';
+  } else if (envFallback === 'none' || envFallback === 'false') {
+    config.fallback = false;
+  }
+}
+
 let workerPool = null;
 
 function getWorkerPool() {
@@ -73,11 +86,15 @@ function configure(options = {}) {
     config.forceFallback = options.forceFallback;
   }
 
-  if (typeof options.workerPoolSize === 'number' && options.workerPoolSize >= 1) {
-    config.workerPoolSize = Math.floor(options.workerPoolSize);
+  if (typeof options.workerPoolSize === 'number' && Number.isFinite(options.workerPoolSize) && options.workerPoolSize >= 1) {
+    const nextPoolSize = Math.floor(options.workerPoolSize);
+    config.workerPoolSize = nextPoolSize;
+    if (workerPool && workerPool.poolSize !== nextPoolSize) {
+      workerPool.poolSize = nextPoolSize;
+    }
   }
 
-  if (typeof options.optimisticReadSize === 'number') {
+  if (typeof options.optimisticReadSize === 'number' && Number.isFinite(options.optimisticReadSize)) {
     const size = Math.max(0, Math.floor(options.optimisticReadSize));
     config.optimisticReadSize = size;
     if (native && typeof native.setOptimisticReadSize === 'function') {
@@ -99,8 +116,10 @@ function configure(options = {}) {
  * @param {number} bytes
  */
 function setOptimisticReadSize(bytes) {
-  if (typeof bytes !== 'number' || bytes < 0) {
-    throw new TypeError('The "bytes" argument must be a non-negative number.');
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) {
+    const err = new TypeError('The "bytes" argument must be a non-negative finite number.');
+    err.code = 'ERR_INVALID_ARG_VALUE';
+    throw err;
   }
   const size = Math.floor(bytes);
   config.optimisticReadSize = size;
@@ -210,7 +229,19 @@ function normalizePath(p) {
   if (p instanceof URL) {
     return fileURLToPath(p);
   }
-  throw new TypeError('The "path" argument must be of type string, Buffer, or URL.');
+  const err = new TypeError('The "path" argument must be of type string, Buffer, or URL.');
+  err.code = 'ERR_INVALID_ARG_TYPE';
+  throw err;
+}
+
+function validateEncoding(encoding) {
+  if (encoding !== null && encoding !== undefined) {
+    if (typeof encoding !== 'string' || !Buffer.isEncoding(encoding)) {
+      const err = new TypeError(`The argument 'encoding' is invalid encoding. Received '${encoding}'`);
+      err.code = 'ERR_INVALID_ARG_VALUE';
+      throw err;
+    }
+  }
 }
 
 function parseWriteFlags(flag = 'w') {
@@ -224,18 +255,36 @@ function parseWriteFlags(flag = 'w') {
     case 'wx':
     case 'xw':
       return fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_EXCL;
+    case 'w+':
+      return fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_TRUNC;
+    case 'wx+':
+    case 'xw+':
+      return fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_EXCL;
     case 'a':
     case 'at':
       return fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND;
     case 'ax':
     case 'xa':
       return fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND | fsConstants.O_EXCL;
+    case 'a+':
+      return fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_APPEND;
+    case 'ax+':
+    case 'xa+':
+      return fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_APPEND | fsConstants.O_EXCL;
+    case 'as':
+      return fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND | fsConstants.O_SYNC;
+    case 'as+':
+      return fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_APPEND | fsConstants.O_SYNC;
     case 'r+':
       return fsConstants.O_RDWR;
-    case 'w+':
-      return fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_TRUNC;
-    default:
-      throw new Error(`Unknown file open flag: ${flag}`);
+    case 'rs+':
+    case 'sr+':
+      return fsConstants.O_RDWR | fsConstants.O_SYNC;
+    default: {
+      const err = new TypeError(`Unknown file open flag: ${flag}`);
+      err.code = 'ERR_INVALID_OPT_VALUE';
+      throw err;
+    }
   }
 }
 
@@ -281,8 +330,12 @@ function wrapWithAbortSignal(promise, signal) {
 function selectExecutionBackend(options) {
   const strict = options && typeof options === 'object' ? options.strict : undefined;
   const perCallFallback = options && typeof options === 'object' ? options.fallback : undefined;
+  const forcePerCallFallback =
+    perCallFallback !== undefined &&
+    perCallFallback !== false &&
+    perCallFallback !== 'none';
 
-  if (isUringSupported() && !config.forceFallback && perCallFallback === undefined) {
+  if (isUringSupported() && !config.forceFallback && !forcePerCallFallback) {
     return { type: 'io_uring' };
   }
 
@@ -307,6 +360,8 @@ function selectExecutionBackend(options) {
 
 class UringStats {
   constructor(raw) {
+    this.dev = raw.dev ?? 0;
+    this.rdev = raw.rdev ?? 0;
     this.size = raw.size;
     this.mode = raw.mode;
     this.uid = raw.uid;
@@ -339,6 +394,22 @@ class UringStats {
   isSymbolicLink() {
     return this._isSymbolicLink;
   }
+
+  isBlockDevice() {
+    return (this.mode & 0o170000) === 0o060000;
+  }
+
+  isCharacterDevice() {
+    return (this.mode & 0o170000) === 0o020000;
+  }
+
+  isFIFO() {
+    return (this.mode & 0o170000) === 0o010000;
+  }
+
+  isSocket() {
+    return (this.mode & 0o170000) === 0o140000;
+  }
 }
 
 /**
@@ -354,10 +425,12 @@ async function readFile(filePath, options) {
   } else if (options && typeof options === 'object') {
     encoding = options.encoding ?? null;
     signal = options.signal;
-    if (typeof options.optimisticReadSize === 'number') {
+    if (typeof options.optimisticReadSize === 'number' && Number.isFinite(options.optimisticReadSize)) {
       optimisticReadSize = Math.max(0, Math.floor(options.optimisticReadSize));
     }
   }
+
+  validateEncoding(encoding);
 
   if (signal && signal.aborted) {
     throw createAbortError(signal);
@@ -367,7 +440,10 @@ async function readFile(filePath, options) {
   const backend = selectExecutionBackend(options);
 
   if (backend.type === 'provider') {
-    return backend.provider.readFile(normalized, encoding ? { encoding, signal } : (signal ? { signal } : undefined));
+    return wrapWithAbortSignal(
+      backend.provider.readFile(normalized, encoding ? { encoding, signal } : (signal ? { signal } : undefined)),
+      signal
+    );
   }
 
   if (backend.type === 'worker') {
@@ -406,6 +482,8 @@ async function writeFile(filePath, data, options) {
     signal = options.signal;
   }
 
+  validateEncoding(encoding);
+
   if (signal && signal.aborted) {
     throw createAbortError(signal);
   }
@@ -414,7 +492,10 @@ async function writeFile(filePath, data, options) {
   const backend = selectExecutionBackend(options);
 
   if (backend.type === 'provider') {
-    await backend.provider.writeFile(normalized, data, { encoding, mode, flag, flush, signal });
+    await wrapWithAbortSignal(
+      backend.provider.writeFile(normalized, data, { encoding, mode, flag, flush, signal }),
+      signal
+    );
     return;
   }
 
@@ -428,6 +509,8 @@ async function writeFile(filePath, data, options) {
   let payload = data;
   if (typeof data === 'string' && encoding !== 'utf8' && encoding !== 'utf-8') {
     payload = Buffer.from(data, encoding);
+  } else if (ArrayBuffer.isView(data) && !Buffer.isBuffer(data) && !(data instanceof Uint8Array)) {
+    payload = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
   }
 
   const rawPromise = native.writeFile(normalized, payload, numericFlags, mode, flush);
@@ -520,6 +603,75 @@ async function lstat(filePath, options) {
 }
 
 /**
+ * Tests a user's permissions for the file or directory specified by path via 1-SQE io_uring statx.
+ */
+async function access(filePath, modeOrOptions, options) {
+  let mode = fsConstants.F_OK;
+  let opts = options;
+
+  if (typeof modeOrOptions === 'number') {
+    mode = modeOrOptions;
+  } else if (modeOrOptions && typeof modeOrOptions === 'object') {
+    opts = modeOrOptions;
+    if (modeOrOptions.mode !== undefined) {
+      mode = modeOrOptions.mode;
+    }
+  } else if (modeOrOptions !== undefined) {
+    const err = new TypeError(`The "mode" argument must be of type number. Received ${typeof modeOrOptions}`);
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+
+  if (typeof mode !== 'number' || !Number.isInteger(mode) || mode < 0 || mode > 7) {
+    const err = new RangeError(`The value of "mode" is out of range. It must be an integer >= 0 && <= 7. Received ${mode}`);
+    err.code = 'ERR_OUT_OF_RANGE';
+    throw err;
+  }
+
+  const signal = opts && opts.signal;
+  if (signal && signal.aborted) {
+    throw createAbortError(signal);
+  }
+
+  const normalized = normalizePath(filePath);
+  const backend = selectExecutionBackend(opts);
+
+  if (backend.type === 'provider') {
+    if (typeof backend.provider.access === 'function') {
+      return wrapWithAbortSignal(backend.provider.access(normalized, mode), signal);
+    }
+    return wrapWithAbortSignal(
+      backend.provider.stat(normalized).then(() => undefined),
+      signal
+    );
+  }
+
+  if (backend.type === 'worker') {
+    return wrapWithAbortSignal(getWorkerPool().exec('access', [normalized, mode]), signal);
+  }
+
+  return wrapWithAbortSignal(native.access(normalized, mode), signal);
+}
+
+/**
+ * Tests whether or not the given path exists on the filesystem via 1-SQE io_uring statx.
+ */
+async function exists(filePath, options) {
+  try {
+    await access(filePath, fsConstants.F_OK, options);
+    return true;
+  } catch (err) {
+    if (
+      err instanceof TypeError ||
+      (err && (err.code === 'ABORT_ERR' || err.code === 'ERR_URING_UNSUPPORTED' || err.code === 'ERR_INVALID_ARG_TYPE'))
+    ) {
+      throw err;
+    }
+    return false;
+  }
+}
+
+/**
  * Removes a file or symbolic link asynchronously via io_uring unlinkat.
  */
 async function unlink(filePath, options) {
@@ -581,13 +733,17 @@ async function mkdir(dirPath, options) {
     if (err.code === 'ENOENT') {
       const parent = pathModule.dirname(resolved);
       if (parent !== resolved) {
-        await mkdir(parent, { ...(typeof options === 'object' ? options : {}), recursive: true, mode });
+        const firstCreated = await mkdir(parent, { ...(typeof options === 'object' ? options : {}), recursive: true, mode });
         try {
           await native.mkdir(resolved, mode);
+          return firstCreated ?? resolved;
         } catch (e2) {
-          if (e2.code !== 'EEXIST') throw e2;
+          if (e2.code === 'EEXIST') {
+            const st = await stat(resolved, options);
+            if (st.isDirectory()) return firstCreated;
+          }
+          throw e2;
         }
-        return resolved;
       }
     }
     throw err;
@@ -720,6 +876,8 @@ module.exports = {
   copyFile,
   stat,
   lstat,
+  access,
+  exists,
   unlink,
   mkdir,
   rename,
@@ -736,4 +894,9 @@ module.exports = {
   closeFallbackWorkers,
   UringStats,
   constants: fsConstants,
+  F_OK: fsConstants.F_OK,
+  R_OK: fsConstants.R_OK,
+  W_OK: fsConstants.W_OK,
+  X_OK: fsConstants.X_OK,
+  COPYFILE_EXCL: fsConstants.COPYFILE_EXCL,
 };

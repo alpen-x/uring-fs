@@ -10,6 +10,7 @@ export interface CustomFsProvider {
   copyFile?: (src: string, dest: string, mode?: number) => Promise<void>;
   stat: (path: string) => Promise<any>;
   lstat?: (path: string) => Promise<any>;
+  access?: (path: string, mode?: number) => Promise<void>;
   unlink: (path: string) => Promise<void>;
   mkdir: (path: string, options?: any) => Promise<string | undefined>;
   rename?: (oldPath: string, newPath: string) => Promise<void>;
@@ -114,6 +115,8 @@ export interface RingStats {
 }
 
 export class UringStats {
+  readonly dev: number;
+  readonly rdev: number;
   readonly size: number;
   readonly mode: number;
   readonly uid: number;
@@ -134,6 +137,10 @@ export class UringStats {
   isFile(): boolean;
   isDirectory(): boolean;
   isSymbolicLink(): boolean;
+  isBlockDevice(): boolean;
+  isCharacterDevice(): boolean;
+  isFIFO(): boolean;
+  isSocket(): boolean;
 }
 
 export function readFile(
@@ -151,13 +158,13 @@ export function readFile(
 
 export function writeFile(
   path: PathLike,
-  data: string | Buffer | Uint8Array,
+  data: string | Buffer | NodeJS.ArrayBufferView,
   options?: BufferEncoding | UringWriteOptions | null
 ): Promise<void>;
 
 export function appendFile(
   path: PathLike,
-  data: string | Buffer | Uint8Array,
+  data: string | Buffer | NodeJS.ArrayBufferView,
   options?: BufferEncoding | UringWriteOptions | null
 ): Promise<void>;
 
@@ -167,9 +174,22 @@ export function copyFile(
   options?: number | UringCopyOptions
 ): Promise<void>;
 
+export interface UringAccessOptions extends UringCommonOptions {
+  mode?: number;
+  signal?: AbortSignal;
+}
+
 export function stat(path: PathLike, options?: UringCommonOptions): Promise<UringStats>;
 
 export function lstat(path: PathLike, options?: UringCommonOptions): Promise<UringStats>;
+
+export function access(
+  path: PathLike,
+  modeOrOptions?: number | UringAccessOptions,
+  options?: UringAccessOptions
+): Promise<void>;
+
+export function exists(path: PathLike, options?: UringAccessOptions): Promise<boolean>;
 
 export function unlink(path: PathLike, options?: UringCommonOptions): Promise<void>;
 
@@ -213,3 +233,42 @@ export function configure(options?: UringFsConfig): {
 export function setOptimisticReadSize(bytes: number): number;
 export function closeFallbackWorkers(): Promise<void>;
 export const constants: typeof import('node:fs').constants;
+export const F_OK: number;
+export const R_OK: number;
+export const W_OK: number;
+export const X_OK: number;
+export const COPYFILE_EXCL: number;
+
+declare const _default: {
+  readFile: typeof readFile;
+  writeFile: typeof writeFile;
+  appendFile: typeof appendFile;
+  copyFile: typeof copyFile;
+  stat: typeof stat;
+  lstat: typeof lstat;
+  access: typeof access;
+  exists: typeof exists;
+  unlink: typeof unlink;
+  mkdir: typeof mkdir;
+  rename: typeof rename;
+  symlink: typeof symlink;
+  link: typeof link;
+  fsync: typeof fsync;
+  fdatasync: typeof fdatasync;
+  isUringSupported: typeof isUringSupported;
+  getActiveBackend: typeof getActiveBackend;
+  getUnsupportedReason: typeof getUnsupportedReason;
+  getRingStats: typeof getRingStats;
+  configure: typeof configure;
+  setOptimisticReadSize: typeof setOptimisticReadSize;
+  closeFallbackWorkers: typeof closeFallbackWorkers;
+  UringStats: typeof UringStats;
+  constants: typeof constants;
+  F_OK: typeof F_OK;
+  R_OK: typeof R_OK;
+  W_OK: typeof W_OK;
+  X_OK: typeof X_OK;
+  COPYFILE_EXCL: typeof COPYFILE_EXCL;
+};
+
+export default _default;
