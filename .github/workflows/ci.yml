@@ -8,6 +8,9 @@ on:
     branches:
       - main
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   linux-io-uring:
     name: Linux io_uring (Node ${{ matrix.node-version }})
@@ -15,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: ['20.x', '22.x', '24.x']
+        node-version: ['22.x', '24.x']
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -38,7 +41,7 @@ jobs:
         run: npm test
 
   fallback-stub:
-    name: Fallback Stub (${{ matrix.os }}, Node 22.x)
+    name: Fallback Stub (${{ matrix.os }}, Node 24.x)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -53,10 +56,10 @@ jobs:
         run: |
           sudo apt-get remove -y liburing-dev || true
 
-      - name: Setup Node.js 22.x
+      - name: Setup Node.js 24.x
         uses: actions/setup-node@v4
         with:
-          node-version: '22.x'
+          node-version: '24.x'
 
       - name: Install dependencies and build stub addon
         run: npm install

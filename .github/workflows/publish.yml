@@ -10,6 +10,9 @@ permissions:
   contents: read
   id-token: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   publish:
     name: Build, Verify & Publish to npm
@@ -24,10 +27,10 @@ jobs:
           sudo apt-get install -y liburing-dev
           sudo sysctl -w kernel.io_uring_disabled=0 || true
 
-      - name: Setup Node.js 22.x for npm registry
+      - name: Setup Node.js 24.x for npm registry
         uses: actions/setup-node@v4
         with:
-          node-version: '22.x'
+          node-version: '24.x'
           registry-url: 'https://registry.npmjs.org'
 
       - name: Upgrade npm for OIDC Trusted Publishing support
