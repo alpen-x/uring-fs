@@ -39,7 +39,7 @@ jobs:
       - name: Run full test suite before publishing
         run: npm test
 
-      - name: Publish package to npm (OIDC Trusted Publishing or NPM_TOKEN)
+      - name: Publish or Stage package to npm (OIDC Trusted Publishing or NPM_TOKEN)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
@@ -47,4 +47,4 @@ jobs:
             unset NODE_AUTH_TOKEN
             npm config delete //registry.npmjs.org/:_authToken || true
           fi
-          npm publish --provenance --access public
+          npm publish --provenance --access public || npm stage publish --provenance --access public
