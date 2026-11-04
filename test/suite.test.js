@@ -82,10 +82,13 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     const largeData = crypto.randomBytes(8 * 1024 * 1024);
     await uringFs.writeFile(largeFile, largeData);
 
-    const fdsBeforeCopy = fs.readdirSync('/proc/self/fd').length;
+    const hasProcFd = fs.existsSync('/proc/self/fd');
+    const fdsBeforeCopy = hasProcFd ? fs.readdirSync('/proc/self/fd').length : 0;
     await uringFs.copyFile(largeFile, largeCopy);
-    const fdsAfterCopy = fs.readdirSync('/proc/self/fd').length;
-    assert.equal(fdsAfterCopy, fdsBeforeCopy, 'Zero-copy kernel splice must close all pipe and file descriptors');
+    const fdsAfterCopy = hasProcFd ? fs.readdirSync('/proc/self/fd').length : 0;
+    if (hasProcFd) {
+      assert.equal(fdsAfterCopy, fdsBeforeCopy, 'Zero-copy kernel splice must close all pipe and file descriptors');
+    }
 
     const readLarge = await uringFs.readFile(largeCopy);
     assert.equal(readLarge.length, largeData.length);

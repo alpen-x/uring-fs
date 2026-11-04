@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install liburing-dev and enable kernel io_uring
         run: |
@@ -28,7 +28,7 @@ jobs:
           sudo sysctl -w kernel.io_uring_disabled=0 || true
 
       - name: Setup Node.js 24.x for npm registry
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '24.x'
           registry-url: 'https://registry.npmjs.org'
@@ -46,6 +46,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          npm config delete always-auth || true
           if [ -z "$NODE_AUTH_TOKEN" ]; then
             unset NODE_AUTH_TOKEN
             npm config delete //registry.npmjs.org/:_authToken || true

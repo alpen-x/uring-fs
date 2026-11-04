@@ -21,7 +21,7 @@ jobs:
         node-version: ['22.x', '24.x']
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install liburing-dev and enable kernel io_uring
         run: |
@@ -30,7 +30,7 @@ jobs:
           sudo sysctl -w kernel.io_uring_disabled=0 || true
 
       - name: Setup Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node-version }}
 
@@ -49,7 +49,7 @@ jobs:
         os: [ubuntu-24.04, macos-latest]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Ensure liburing headers are absent (Linux stub test)
         if: runner.os == 'Linux'
@@ -57,7 +57,7 @@ jobs:
           sudo apt-get remove -y liburing-dev || true
 
       - name: Setup Node.js 24.x
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '24.x'
 
