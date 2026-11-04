@@ -2,33 +2,64 @@ name: CI
 
 on:
   push:
-    branches: [ main, master ]
+    branches:
+      - main
   pull_request:
-    branches: [ main, master ]
+    branches:
+      - main
 
 jobs:
-  test-linux:
-    runs-on: ubuntu-latest
+  linux-io-uring:
+    name: Linux io_uring (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
-        node-version: [ 20.x, 22.x, 24.x ]
+        node-version: ['20.x', '22.x', '24.x']
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install liburing-dev
-        run: sudo apt-get update && sudo apt-get install -y liburing-dev build-essential
+      - name: Install liburing-dev and enable kernel io_uring
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev
+          sudo sysctl -w kernel.io_uring_disabled=0 || true
 
       - name: Setup Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
 
-      - name: Enable io_uring in GitHub Actions runner
-        run: sudo sysctl -w kernel.io_uring_disabled=0 || true
-
-      - name: Install dependencies & build native addon
+      - name: Install dependencies and build native addon
         run: npm install
 
       - name: Run test suite
+        run: npm test
+
+  fallback-stub:
+    name: Fallback Stub (${{ matrix.os }}, Node 22.x)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ensure liburing headers are absent (Linux stub test)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get remove -y liburing-dev || true
+
+      - name: Setup Node.js 22.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+
+      - name: Install dependencies and build stub addon
+        run: npm install
+
+      - name: Run test suite in fallback mode
         run: npm test

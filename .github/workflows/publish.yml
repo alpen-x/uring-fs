@@ -1,0 +1,50 @@
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Build, Verify & Publish to npm
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install liburing-dev and enable kernel io_uring
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev
+          sudo sysctl -w kernel.io_uring_disabled=0 || true
+
+      - name: Setup Node.js 22.x for npm registry
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Upgrade npm for OIDC Trusted Publishing support
+        run: npm install -g npm@latest
+
+      - name: Install dependencies and build native addon
+        run: npm install
+
+      - name: Run full test suite before publishing
+        run: npm test
+
+      - name: Publish package to npm (OIDC Trusted Publishing or NPM_TOKEN)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            unset NODE_AUTH_TOKEN
+            npm config delete //registry.npmjs.org/:_authToken || true
+          fi
+          npm publish --provenance --access public
