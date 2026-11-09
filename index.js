@@ -244,6 +244,40 @@ function validateEncoding(encoding) {
   }
 }
 
+const FALLOC_FL_KEEP_SIZE = 0x01;
+const FALLOC_FL_PUNCH_HOLE = 0x02;
+const FALLOC_FL_COLLAPSE_RANGE = 0x08;
+const FALLOC_FL_ZERO_RANGE = 0x10;
+const FALLOC_FL_INSERT_RANGE = 0x20;
+const FALLOC_FL_UNSHARE_RANGE = 0x40;
+
+const POSIX_FADV_NORMAL = 0;
+const POSIX_FADV_RANDOM = 1;
+const POSIX_FADV_SEQUENTIAL = 2;
+const POSIX_FADV_WILLNEED = 3;
+const POSIX_FADV_DONTNEED = 4;
+const POSIX_FADV_NOREUSE = 5;
+
+function parseOpenFlags(flag = 'r') {
+  if (typeof flag === 'number') {
+    return flag;
+  }
+  if (typeof flag !== 'string') {
+    const err = new TypeError(`The "flags" argument must be of type string or number. Received ${typeof flag}`);
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+  switch (flag) {
+    case 'r':
+      return fsConstants.O_RDONLY;
+    case 'rs':
+    case 'sr':
+      return fsConstants.O_RDONLY | fsConstants.O_SYNC;
+    default:
+      return parseWriteFlags(flag);
+  }
+}
+
 function parseWriteFlags(flag = 'w') {
   if (typeof flag === 'number') {
     return flag;
@@ -294,6 +328,29 @@ function createAbortError(signal) {
   err.code = 'ABORT_ERR';
   if (signal && signal.reason !== undefined) {
     err.cause = signal.reason;
+  }
+  return err;
+}
+
+function createErrnoError(code, syscall, path) {
+  let errno = -21;
+  let msg = `${code}: illegal operation on a directory, ${syscall}`;
+  if (code === 'ENOENT') {
+    errno = -2;
+    msg = `ENOENT: no such file or directory, ${syscall}`;
+  } else if (code === 'EBADF') {
+    errno = -9;
+    msg = `EBADF: bad file descriptor, ${syscall}`;
+  }
+  if (path) {
+    msg += ` '${path}'`;
+  }
+  const err = new Error(msg);
+  err.code = code;
+  err.errno = errno;
+  err.syscall = syscall;
+  if (path) {
+    err.path = path;
   }
   return err;
 }
@@ -1088,7 +1145,1294 @@ async function fdatasync(filePath, options) {
   await wrapWithAbortSignal(native.fsync(normalized, true), signal);
 }
 
+class UringFileHandle {
+  #backend;
+  #path;
+  #flags;
+  #mode;
+  #fd;
+  #directSlot;
+  #nodeHandle;
+  #closed = false;
+  #activeOps = 0;
+  #drainResolvers = [];
+  #closePromise = null;
+
+  constructor(backend, path, flags, mode, descriptorInfo, nodeHandle = null) {
+    this.#backend = backend;
+    this.#path = path;
+    this.#flags = flags;
+    this.#mode = mode;
+    this.#fd = descriptorInfo?.fd ?? -1;
+    this.#directSlot = descriptorInfo?.directSlot ?? -1;
+    this.#nodeHandle = nodeHandle;
+  }
+
+  get fd() {
+    if (this.#closed) {
+      return -1;
+    }
+    if (this.#backend === 'io_uring') {
+      return this.#fd;
+    }
+    return this.#nodeHandle ? this.#nodeHandle.fd : -1;
+  }
+
+  get directSlot() {
+    return this.#closed ? -1 : this.#directSlot;
+  }
+
+  get closed() {
+    return this.#closed;
+  }
+
+  #ensureOpen() {
+    if (this.#closed) {
+      const err = new Error('EBADF: bad file descriptor, file handle is closed');
+      err.code = 'EBADF';
+      err.errno = -9;
+      err.syscall = 'filehandle';
+      throw err;
+    }
+  }
+
+  #beginOp() {
+    this.#ensureOpen();
+    this.#activeOps++;
+  }
+
+  #endOp() {
+    this.#activeOps--;
+    if (this.#activeOps === 0 && this.#drainResolvers.length > 0) {
+      const resolvers = this.#drainResolvers;
+      this.#drainResolvers = [];
+      for (const resolve of resolvers) {
+        resolve();
+      }
+    }
+  }
+
+  async read(buffer, offset, length, position) {
+    this.#beginOp();
+    try {
+      let callerBuffer = buffer;
+      let targetBuf = buffer;
+      let bufOffset = offset;
+      let readLen = length;
+      let pos = position;
+
+      if (targetBuf && typeof targetBuf === 'object' && !Buffer.isBuffer(targetBuf) && !(targetBuf instanceof Uint8Array)) {
+        bufOffset = targetBuf.offset;
+        readLen = targetBuf.length;
+        pos = targetBuf.position;
+        targetBuf = targetBuf.buffer;
+        callerBuffer = targetBuf;
+      }
+
+      if (!targetBuf) {
+        targetBuf = Buffer.alloc(16384);
+        callerBuffer = targetBuf;
+      } else if (!Buffer.isBuffer(targetBuf) && targetBuf instanceof Uint8Array) {
+        targetBuf = Buffer.from(targetBuf.buffer, targetBuf.byteOffset, targetBuf.byteLength);
+      } else if (!Buffer.isBuffer(targetBuf)) {
+        const err = new TypeError('The "buffer" argument must be an instance of Buffer or Uint8Array.');
+        err.code = 'ERR_INVALID_ARG_TYPE';
+        throw err;
+      }
+
+      if (bufOffset !== undefined && bufOffset !== null) {
+        if (typeof bufOffset !== 'number') {
+          const err = new TypeError(`The "offset" argument must be of type number. Received ${typeof bufOffset}`);
+          err.code = 'ERR_INVALID_ARG_TYPE';
+          throw err;
+        }
+        if (!Number.isInteger(bufOffset) || bufOffset < 0) {
+          const err = new RangeError(`The value of "offset" is out of range. It must be an integer >= 0. Received ${bufOffset}`);
+          err.code = 'ERR_OUT_OF_RANGE';
+          throw err;
+        }
+      } else {
+        bufOffset = 0;
+      }
+
+      if (readLen !== undefined && readLen !== null) {
+        if (typeof readLen !== 'number') {
+          const err = new TypeError(`The "length" argument must be of type number. Received ${typeof readLen}`);
+          err.code = 'ERR_INVALID_ARG_TYPE';
+          throw err;
+        }
+        if (!Number.isInteger(readLen) || readLen < 0) {
+          const err = new RangeError(`The value of "length" is out of range. It must be an integer >= 0. Received ${readLen}`);
+          err.code = 'ERR_OUT_OF_RANGE';
+          throw err;
+        }
+      } else {
+        readLen = callerBuffer.byteLength - bufOffset;
+      }
+
+      if (bufOffset > callerBuffer.byteLength || readLen > callerBuffer.byteLength - bufOffset) {
+        const err = new RangeError('The value of "offset" and "length" is out of range.');
+        err.code = 'ERR_OUT_OF_RANGE';
+        throw err;
+      }
+
+      if (pos !== undefined && pos !== null) {
+        if (typeof pos !== 'number') {
+          const err = new TypeError(`The "position" argument must be of type number. Received ${typeof pos}`);
+          err.code = 'ERR_INVALID_ARG_TYPE';
+          throw err;
+        }
+        if (!Number.isInteger(pos) || pos < -1) {
+          const err = new RangeError(`The value of "position" is out of range. Received ${pos}`);
+          err.code = 'ERR_OUT_OF_RANGE';
+          throw err;
+        }
+      } else {
+        pos = -1;
+      }
+
+      if (this.#backend === 'io_uring') {
+        const bytesRead = await native.fhRead(this.#fd, this.#directSlot, targetBuf, bufOffset, readLen, pos);
+        return { bytesRead, buffer: callerBuffer };
+      }
+
+      const res = await this.#nodeHandle.read(targetBuf, bufOffset, readLen, pos < 0 ? null : pos);
+      return { bytesRead: res.bytesRead, buffer: callerBuffer };
+    } finally {
+      this.#endOp();
+    }
+  }
+
+  async readAt(offset, length, options) {
+    this.#beginOp();
+    try {
+      if (typeof offset !== 'number') {
+        const err = new TypeError(`The "offset" argument must be of type number. Received ${typeof offset}`);
+        err.code = 'ERR_INVALID_ARG_TYPE';
+        throw err;
+      }
+      if (!Number.isInteger(offset) || offset < 0) {
+        const err = new RangeError(`The value of "offset" is out of range. It must be an integer >= 0. Received ${offset}`);
+        err.code = 'ERR_OUT_OF_RANGE';
+        throw err;
+      }
+      if (typeof length !== 'number') {
+        const err = new TypeError(`The "length" argument must be of type number. Received ${typeof length}`);
+        err.code = 'ERR_INVALID_ARG_TYPE';
+        throw err;
+      }
+      if (!Number.isInteger(length) || length < 0) {
+        const err = new RangeError(`The value of "length" is out of range. It must be an integer >= 0. Received ${length}`);
+        err.code = 'ERR_OUT_OF_RANGE';
+        throw err;
+      }
+      let encoding = null;
+      let signal = undefined;
+      if (typeof options === 'string') {
+        encoding = options;
+      } else if (options && typeof options === 'object') {
+        encoding = options.encoding ?? null;
+        signal = options.signal;
+      }
+      validateEncoding(encoding);
+
+      if (signal && signal.aborted) {
+        throw createAbortError(signal);
+      }
+
+      if (length === 0) {
+        return encoding ? '' : Buffer.alloc(0);
+      }
+
+      if (this.#backend === 'io_uring') {
+        const buf = await wrapWithAbortSignal(native.fhReadAt(this.#fd, this.#directSlot, offset, length), signal);
+        return encoding ? buf.toString(encoding) : buf;
+      }
+
+      const buf = Buffer.allocUnsafe(length);
+      const { bytesRead } = await wrapWithAbortSignal(this.#nodeHandle.read(buf, 0, length, offset), signal);
+      const res = bytesRead < length ? buf.subarray(0, bytesRead) : buf;
+      return encoding ? res.toString(encoding) : res;
+    } finally {
+      this.#endOp();
+    }
+  }
+
+  async readBatchAt(ranges, options = {}) {
+    this.#beginOp();
+    try {
+      const signal = options && typeof options === 'object' ? options.signal : undefined;
+      if (signal && signal.aborted) {
+        throw createAbortError(signal);
+      }
+      if (!Array.isArray(ranges)) {
+        const err = new TypeError('The "ranges" argument must be an Array.');
+        err.code = 'ERR_INVALID_ARG_TYPE';
+        throw err;
+      }
+      if (ranges.length === 0) {
+        return [];
+      }
+      const results = [];
+      for (const r of ranges) {
+        if (signal && signal.aborted) {
+          throw createAbortError(signal);
+        }
+        const offset = Array.isArray(r) ? r[0] : r?.offset;
+        const length = Array.isArray(r) ? r[1] : r?.length;
+        results.push(await this.readAt(offset, length, options));
+      }
+      return results;
+    } finally {
+      this.#endOp();
+    }
+  }
+
+  async write(buffer, offsetOrPosition, lengthOrEncoding, position) {
+    this.#beginOp();
+    try {
+      const callerBuffer = buffer;
+      let data = buffer;
+      let offset = 0;
+      let length = 0;
+      let pos = -1;
+
+      if (typeof data === 'string') {
+        let encoding = 'utf8';
+        if (typeof offsetOrPosition === 'string') {
+          encoding = offsetOrPosition;
+          offsetOrPosition = null;
+        } else if (typeof lengthOrEncoding === 'string') {
+          encoding = lengthOrEncoding;
+        }
+        if (offsetOrPosition !== undefined && offsetOrPosition !== null) {
+          if (typeof offsetOrPosition !== 'number') {
+            const err = new TypeError(`The "position" argument must be of type number. Received ${typeof offsetOrPosition}`);
+            err.code = 'ERR_INVALID_ARG_TYPE';
+            throw err;
+          }
+          if (!Number.isInteger(offsetOrPosition) || offsetOrPosition < 0) {
+            const err = new RangeError(`The value of "position" is out of range. Received ${offsetOrPosition}`);
+            err.code = 'ERR_OUT_OF_RANGE';
+            throw err;
+          }
+          pos = offsetOrPosition;
+        }
+        data = Buffer.from(data, encoding);
+        offset = 0;
+        length = data.length;
+      } else {
+        if (!Buffer.isBuffer(data) && data instanceof Uint8Array) {
+          data = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+        } else if (!Buffer.isBuffer(data)) {
+          const err = new TypeError('The "buffer" argument must be of type string or an instance of Buffer or Uint8Array.');
+          err.code = 'ERR_INVALID_ARG_TYPE';
+          throw err;
+        }
+
+        if (offsetOrPosition !== undefined && offsetOrPosition !== null) {
+          if (typeof offsetOrPosition !== 'number') {
+            const err = new TypeError(`The "offset" argument must be of type number. Received ${typeof offsetOrPosition}`);
+            err.code = 'ERR_INVALID_ARG_TYPE';
+            throw err;
+          }
+          if (!Number.isInteger(offsetOrPosition) || offsetOrPosition < 0) {
+            const err = new RangeError(`The value of "offset" is out of range. It must be an integer >= 0. Received ${offsetOrPosition}`);
+            err.code = 'ERR_OUT_OF_RANGE';
+            throw err;
+          }
+          offset = offsetOrPosition;
+        } else {
+          offset = 0;
+        }
+
+        if (lengthOrEncoding !== undefined && lengthOrEncoding !== null) {
+          if (typeof lengthOrEncoding !== 'number') {
+            const err = new TypeError(`The "length" argument must be of type number. Received ${typeof lengthOrEncoding}`);
+            err.code = 'ERR_INVALID_ARG_TYPE';
+            throw err;
+          }
+          if (!Number.isInteger(lengthOrEncoding) || lengthOrEncoding < 0) {
+            const err = new RangeError(`The value of "length" is out of range. It must be an integer >= 0. Received ${lengthOrEncoding}`);
+            err.code = 'ERR_OUT_OF_RANGE';
+            throw err;
+          }
+          length = lengthOrEncoding;
+        } else {
+          length = callerBuffer.byteLength - offset;
+        }
+
+        if (offset > callerBuffer.byteLength || length > callerBuffer.byteLength - offset) {
+          const err = new RangeError('The value of "offset" and "length" is out of range.');
+          err.code = 'ERR_OUT_OF_RANGE';
+          throw err;
+        }
+
+        if (position !== undefined && position !== null) {
+          if (typeof position !== 'number') {
+            const err = new TypeError(`The "position" argument must be of type number. Received ${typeof position}`);
+            err.code = 'ERR_INVALID_ARG_TYPE';
+            throw err;
+          }
+          if (!Number.isInteger(position) || position < -1) {
+            const err = new RangeError(`The value of "position" is out of range. Received ${position}`);
+            err.code = 'ERR_OUT_OF_RANGE';
+            throw err;
+          }
+          pos = position;
+        } else {
+          pos = -1;
+        }
+      }
+
+      if (this.#backend === 'io_uring') {
+        const bytesWritten = await native.fhWrite(
+          this.#fd,
+          this.#directSlot,
+          data,
+          offset,
+          length,
+          pos,
+          this.#flags
+        );
+        return { bytesWritten, buffer: callerBuffer };
+      }
+
+      const res = await this.#nodeHandle.write(data, offset, length, pos < 0 ? null : pos);
+      return { bytesWritten: res.bytesWritten, buffer: callerBuffer };
+    } finally {
+      this.#endOp();
+    }
+  }
+
+  async writeAt(buffer, position) {
+    this.#beginOp();
+    try {
+      if (typeof buffer === 'string') {
+        buffer = Buffer.from(buffer, 'utf8');
+      }
+      const res = await this.write(buffer, 0, buffer.byteLength, position);
+      return res.bytesWritten;
+    } finally {
+      this.#endOp();
+    }
+  }
+
+  async readv(buffers, position = null) {
+    this.#beginOp();
+    try {
+      if (!Array.isArray(buffers)) {
+        const err = new TypeError('The "buffers" argument must be an Array.');
+        err.code = 'ERR_INVALID_ARG_TYPE';
+        throw err;
+      }
+      if (position !== null && position !== undefined) {
+        if (typeof position !== 'number') {
+          const err = new TypeError(`The "position" argument must be of type number. Received ${typeof position}`);
+          err.code = 'ERR_INVALID_ARG_TYPE';
+          throw err;
+        }
+        if (!Number.isInteger(position) || position < 0) {
+          const err = new RangeError(`The value of "position" is out of range. It must be an integer >= 0. Received ${position}`);
+          err.code = 'ERR_OUT_OF_RANGE';
+          throw err;
+        }
+      }
+      if (buffers.length === 0) {
+        return { bytesRead: 0, buffers };
+      }
+      for (let i = 0; i < buffers.length; i++) {
+        if (!Buffer.isBuffer(buffers[i]) && !(buffers[i] instanceof Uint8Array)) {
+          const err = new TypeError(`buffers[${i}] must be a Buffer or Uint8Array.`);
+          err.code = 'ERR_INVALID_ARG_TYPE';
+          throw err;
+        }
+      }
+      const pos = position !== undefined && position !== null ? position : -1;
+      if (this.#backend === 'io_uring') {
+        const bytesRead = await native.fhReadv(this.#fd, this.#directSlot, buffers, pos);
+        return { bytesRead, buffers };
+      }
+      if (typeof this.#nodeHandle.readv === 'function') {
+        return await this.#nodeHandle.readv(buffers, pos < 0 ? null : pos);
+      }
+      let totalBytes = 0;
+      let currentPos = pos >= 0 ? pos : null;
+      for (const b of buffers) {
+        const { bytesRead } = await this.#nodeHandle.read(b, 0, b.length, currentPos);
+        totalBytes += bytesRead;
+        if (currentPos !== null) currentPos += bytesRead;
+        if (bytesRead < b.length) break;
+      }
+      return { bytesRead: totalBytes, buffers };
+    } finally {
+      this.#endOp();
+    }
+  }
+
+  async writev(buffers, position = null) {
+    this.#beginOp();
+    try {
+      if (!Array.isArray(buffers)) {
+        const err = new TypeError('The "buffers" argument must be an Array.');
+        err.code = 'ERR_INVALID_ARG_TYPE';
+        throw err;
+      }
+      if (position !== null && position !== undefined) {
+        if (typeof position !== 'number') {
+          const err = new TypeError(`The "position" argument must be of type number. Received ${typeof position}`);
+          err.code = 'ERR_INVALID_ARG_TYPE';
+          throw err;
+        }
+        if (!Number.isInteger(position) || position < 0) {
+          const err = new RangeError(`The value of "position" is out of range. It must be an integer >= 0. Received ${position}`);
+          err.code = 'ERR_OUT_OF_RANGE';
+          throw err;
+        }
+      }
+      if (buffers.length === 0) {
+        return { bytesWritten: 0, buffers };
+      }
+      for (let i = 0; i < buffers.length; i++) {
+        if (!Buffer.isBuffer(buffers[i]) && !(buffers[i] instanceof Uint8Array)) {
+          const err = new TypeError(`buffers[${i}] must be a Buffer or Uint8Array.`);
+          err.code = 'ERR_INVALID_ARG_TYPE';
+          throw err;
+        }
+      }
+      const pos = position !== undefined && position !== null ? position : -1;
+      if (this.#backend === 'io_uring') {
+        const bytesWritten = await native.fhWritev(this.#fd, this.#directSlot, buffers, pos, this.#flags);
+        return { bytesWritten, buffers };
+      }
+      if (typeof this.#nodeHandle.writev === 'function') {
+        return await this.#nodeHandle.writev(buffers, pos < 0 ? null : pos);
+      }
+      let totalBytes = 0;
+      let currentPos = pos >= 0 ? pos : null;
+      for (const b of buffers) {
+        const { bytesWritten } = await this.#nodeHandle.write(b, 0, b.length, currentPos);
+        totalBytes += bytesWritten;
+        if (currentPos !== null) currentPos += bytesWritten;
+      }
+      return { bytesWritten: totalBytes, buffers };
+    } finally {
+      this.#endOp();
+    }
+  }
+
+  async sync() {
+    this.#beginOp();
+    try {
+      if (this.#backend === 'io_uring') {
+        await native.fhSync(this.#fd, this.#directSlot, false);
+        return;
+      }
+      await this.#nodeHandle.sync();
+    } finally {
+      this.#endOp();
+    }
+  }
+
+  async datasync() {
+    this.#beginOp();
+    try {
+      if (this.#backend === 'io_uring') {
+        await native.fhSync(this.#fd, this.#directSlot, true);
+        return;
+      }
+      await this.#nodeHandle.datasync();
+    } finally {
+      this.#endOp();
+    }
+  }
+
+  async fallocate(offset, length, mode = 0) {
+    this.#beginOp();
+    try {
+      if (typeof offset !== 'number') {
+        const err = new TypeError(`The "offset" argument must be of type number. Received ${typeof offset}`);
+        err.code = 'ERR_INVALID_ARG_TYPE';
+        throw err;
+      }
+      if (!Number.isInteger(offset) || offset < 0) {
+        const err = new RangeError(`The value of "offset" is out of range. It must be an integer >= 0. Received ${offset}`);
+        err.code = 'ERR_OUT_OF_RANGE';
+        throw err;
+      }
+      if (typeof length !== 'number') {
+        const err = new TypeError(`The "length" argument must be of type number. Received ${typeof length}`);
+        err.code = 'ERR_INVALID_ARG_TYPE';
+        throw err;
+      }
+      if (!Number.isInteger(length) || length < 0) {
+        const err = new RangeError(`The value of "length" is out of range. It must be an integer >= 0. Received ${length}`);
+        err.code = 'ERR_OUT_OF_RANGE';
+        throw err;
+      }
+      if (mode !== undefined && mode !== null) {
+        if (typeof mode !== 'number') {
+          const err = new TypeError(`The "mode" argument must be of type number. Received ${typeof mode}`);
+          err.code = 'ERR_INVALID_ARG_TYPE';
+          throw err;
+        }
+        if (!Number.isInteger(mode) || mode < 0) {
+          const err = new RangeError(`The value of "mode" is out of range. Received ${mode}`);
+          err.code = 'ERR_OUT_OF_RANGE';
+          throw err;
+        }
+      }
+      const fallocMode = typeof mode === 'number' ? mode : 0;
+      if (this.#backend === 'io_uring') {
+        await native.fhFallocate(this.#fd, this.#directSlot, fallocMode, offset, length);
+        return;
+      }
+      const st = await this.#nodeHandle.stat();
+      if (offset + length > st.size && (fallocMode & FALLOC_FL_KEEP_SIZE) === 0) {
+        await this.#nodeHandle.truncate(offset + length);
+      }
+    } finally {
+      this.#endOp();
+    }
+  }
+
+  async fadvise(offset, length, advice) {
+    this.#beginOp();
+    try {
+      if (typeof offset !== 'number') {
+        const err = new TypeError(`The "offset" argument must be of type number. Received ${typeof offset}`);
+        err.code = 'ERR_INVALID_ARG_TYPE';
+        throw err;
+      }
+      if (!Number.isInteger(offset) || offset < 0) {
+        const err = new RangeError(`The value of "offset" is out of range. It must be an integer >= 0. Received ${offset}`);
+        err.code = 'ERR_OUT_OF_RANGE';
+        throw err;
+      }
+      if (typeof length !== 'number') {
+        const err = new TypeError(`The "length" argument must be of type number. Received ${typeof length}`);
+        err.code = 'ERR_INVALID_ARG_TYPE';
+        throw err;
+      }
+      if (!Number.isInteger(length) || length < 0) {
+        const err = new RangeError(`The value of "length" is out of range. It must be an integer >= 0. Received ${length}`);
+        err.code = 'ERR_OUT_OF_RANGE';
+        throw err;
+      }
+      if (typeof advice !== 'number') {
+        const err = new TypeError(`The "advice" argument must be of type number. Received ${typeof advice}`);
+        err.code = 'ERR_INVALID_ARG_TYPE';
+        throw err;
+      }
+      if (!Number.isInteger(advice) || advice < 0) {
+        const err = new RangeError(`The value of "advice" is out of range. Received ${advice}`);
+        err.code = 'ERR_OUT_OF_RANGE';
+        throw err;
+      }
+
+      if (this.#backend === 'io_uring') {
+        await native.fhFadvise(this.#fd, this.#directSlot, offset, length, advice);
+        return;
+      }
+      return;
+    } finally {
+      this.#endOp();
+    }
+  }
+
+  async stat(options) {
+    this.#beginOp();
+    try {
+      if (this.#backend === 'io_uring') {
+        return await stat(this.#path, options);
+      }
+      const st = await this.#nodeHandle.stat(options);
+      return (st instanceof UringStats) ? st : new UringStats(st);
+    } finally {
+      this.#endOp();
+    }
+  }
+
+  async close() {
+    if (this.#closed) {
+      return this.#closePromise;
+    }
+    this.#closed = true;
+    this.#closePromise = (async () => {
+      if (this.#activeOps > 0) {
+        await new Promise((r) => this.#drainResolvers.push(r));
+      }
+      if (this.#backend === 'io_uring') {
+        await native.fhClose(this.#fd, this.#directSlot);
+        return;
+      }
+      if (this.#nodeHandle && typeof this.#nodeHandle.close === 'function') {
+        await this.#nodeHandle.close();
+      }
+    })();
+    return this.#closePromise;
+  }
+
+  async [Symbol.asyncDispose]() {
+    await this.close();
+  }
+}
+
+/**
+ * Reads multiple byte ranges from a file in batch via linked io_uring requests or single-FD fallback.
+ */
+async function readBatchAt(filePath, ranges, options = {}) {
+  let encoding = null;
+  let signal = undefined;
+
+  if (typeof options === 'string') {
+    encoding = options;
+  } else if (options && typeof options === 'object') {
+    encoding = options.encoding ?? null;
+    signal = options.signal;
+  }
+
+  validateEncoding(encoding);
+
+  if (signal && signal.aborted) {
+    throw createAbortError(signal);
+  }
+
+  if (!Array.isArray(ranges)) {
+    const err = new TypeError('The "ranges" argument must be an Array.');
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+
+  if (ranges.length === 0) {
+    await readAt(filePath, 0, 0, options);
+    return [];
+  }
+
+  const normalizedRanges = ranges.map((r, idx) => {
+    let offset, length;
+    if (Array.isArray(r)) {
+      [offset, length] = r;
+    } else if (r && typeof r === 'object') {
+      offset = r.offset;
+      length = r.length;
+    } else {
+      const err = new TypeError(`Invalid range at index ${idx}`);
+      err.code = 'ERR_INVALID_ARG_TYPE';
+      throw err;
+    }
+    if (typeof offset !== 'number') {
+      const err = new TypeError(`The "offset" at index ${idx} must be of type number. Received ${typeof offset}`);
+      err.code = 'ERR_INVALID_ARG_TYPE';
+      throw err;
+    }
+    if (!Number.isInteger(offset) || offset < 0) {
+      const err = new RangeError(`The "offset" at index ${idx} must be an integer >= 0. Received ${offset}`);
+      err.code = 'ERR_OUT_OF_RANGE';
+      throw err;
+    }
+    if (typeof length !== 'number') {
+      const err = new TypeError(`The "length" at index ${idx} must be of type number. Received ${typeof length}`);
+      err.code = 'ERR_INVALID_ARG_TYPE';
+      throw err;
+    }
+    if (!Number.isInteger(length) || length < 0) {
+      const err = new RangeError(`The "length" at index ${idx} must be an integer >= 0. Received ${length}`);
+      err.code = 'ERR_OUT_OF_RANGE';
+      throw err;
+    }
+    return { offset, length };
+  });
+
+  const normalized = normalizePath(filePath);
+  const backend = selectExecutionBackend(typeof options === 'object' ? options : undefined);
+
+  if (backend.type === 'provider') {
+    if (typeof backend.provider.readBatchAt === 'function') {
+      return await wrapWithAbortSignal(backend.provider.readBatchAt(normalized, normalizedRanges, options), signal);
+    }
+    if (backend.provider !== fsPromises && typeof backend.provider.open !== 'function') {
+      const fullBuf = await wrapWithAbortSignal(backend.provider.readFile(normalized), signal);
+      const buf = Buffer.isBuffer(fullBuf) ? fullBuf : Buffer.from(fullBuf);
+      return normalizedRanges.map(({ offset, length }) => {
+        const slice = buf.subarray(offset, offset + length);
+        return encoding ? slice.toString(encoding) : slice;
+      });
+    }
+    const openFn = backend.provider.open.bind(backend.provider);
+    const openPromise = openFn(normalized, 'r');
+    if (signal) {
+      openPromise.then(
+        (fh) => {
+          if (signal.aborted && fh && typeof fh.close === 'function') {
+            fh.close().catch(() => {});
+          }
+        },
+        () => {}
+      );
+    }
+    const fh = await wrapWithAbortSignal(openPromise, signal);
+    try {
+      const hasZeroLength = normalizedRanges.some((r) => r.length === 0);
+      if (hasZeroLength && typeof fh.stat === 'function') {
+        const st = await wrapWithAbortSignal(fh.stat(), signal);
+        if (st && typeof st.isDirectory === 'function' && st.isDirectory()) {
+          throw createErrnoError('EISDIR', 'read', normalized);
+        }
+      }
+      const results = [];
+      for (const { offset, length } of normalizedRanges) {
+        if (length === 0) {
+          results.push(encoding ? '' : Buffer.alloc(0));
+          continue;
+        }
+        const buf = Buffer.allocUnsafe(length);
+        const { bytesRead } = await wrapWithAbortSignal(fh.read(buf, 0, length, offset), signal);
+        const slice = bytesRead < length ? buf.subarray(0, bytesRead) : buf;
+        results.push(encoding ? slice.toString(encoding) : slice);
+      }
+      return results;
+    } finally {
+      await fh.close().catch(() => {});
+    }
+  }
+
+  if (backend.type === 'worker') {
+    const rawSlices = await wrapWithAbortSignal(
+      getWorkerPool().exec('readBatchAt', [normalized, normalizedRanges]),
+      signal
+    );
+    return encoding ? rawSlices.map(b => b.toString(encoding)) : rawSlices;
+  }
+
+  const offsets = normalizedRanges.map(r => r.offset);
+  const lengths = normalizedRanges.map(r => r.length);
+  const buffers = await wrapWithAbortSignal(
+    native.readBatchAt(normalized, offsets, lengths),
+    signal
+  );
+  return encoding ? buffers.map(b => b.toString(encoding)) : buffers;
+}
+
+/**
+ * Reads data from a file into an array of buffers using vectored I/O (readv).
+ */
+async function readv(filePath, buffers, position = null, options = {}) {
+  let pos = position;
+  let opts = options;
+  if (typeof pos === 'object' && pos !== null) {
+    opts = pos;
+    pos = null;
+  }
+  if (!Array.isArray(buffers)) {
+    const err = new TypeError('The "buffers" argument must be an Array.');
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+  if (pos !== null && pos !== undefined) {
+    if (typeof pos !== 'number') {
+      const err = new TypeError(`The "position" argument must be of type number. Received ${typeof pos}`);
+      err.code = 'ERR_INVALID_ARG_TYPE';
+      throw err;
+    }
+    if (!Number.isInteger(pos) || pos < 0) {
+      const err = new RangeError(`The value of "position" is out of range. It must be an integer >= 0. Received ${pos}`);
+      err.code = 'ERR_OUT_OF_RANGE';
+      throw err;
+    }
+  }
+  if (buffers.length === 0) {
+    return { bytesRead: 0, buffers };
+  }
+  for (let i = 0; i < buffers.length; i++) {
+    if (!Buffer.isBuffer(buffers[i]) && !(buffers[i] instanceof Uint8Array)) {
+      const err = new TypeError(`buffers[${i}] must be a Buffer or Uint8Array.`);
+      err.code = 'ERR_INVALID_ARG_TYPE';
+      throw err;
+    }
+  }
+
+  const signal = opts?.signal;
+  if (signal && signal.aborted) throw createAbortError(signal);
+
+  const normalized = normalizePath(filePath);
+  const totalBytesToRead = buffers.reduce((acc, b) => acc + b.byteLength, 0);
+  if (totalBytesToRead === 0) {
+    const st = await stat(normalized, opts);
+    if (st && typeof st.isDirectory === 'function' && st.isDirectory()) {
+      throw createErrnoError('EISDIR', 'read', normalized);
+    }
+  }
+
+  const backend = selectExecutionBackend(opts);
+
+  if (backend.type === 'provider') {
+    if (typeof backend.provider.readv === 'function') {
+      return await wrapWithAbortSignal(backend.provider.readv(normalized, buffers, pos), signal);
+    }
+    if (backend.provider !== fsPromises && typeof backend.provider.open !== 'function') {
+      const err = new Error('ERR_METHOD_NOT_IMPLEMENTED: Custom provider does not implement readv or open');
+      err.code = 'ERR_METHOD_NOT_IMPLEMENTED';
+      throw err;
+    }
+    const openFn = backend.provider.open.bind(backend.provider);
+    const openPromise = openFn(normalized, 'r');
+    if (signal) {
+      openPromise.then(
+        (fh) => {
+          if (signal.aborted && fh && typeof fh.close === 'function') {
+            fh.close().catch(() => {});
+          }
+        },
+        () => {}
+      );
+    }
+    const fh = await wrapWithAbortSignal(openPromise, signal);
+    try {
+      const totalBytesToRead = buffers.reduce((acc, b) => acc + b.byteLength, 0);
+      if (totalBytesToRead === 0 && typeof fh.stat === 'function') {
+        const st = await wrapWithAbortSignal(fh.stat(), signal);
+        if (st && typeof st.isDirectory === 'function' && st.isDirectory()) {
+          throw createErrnoError('EISDIR', 'read', normalized);
+        }
+      }
+      if (typeof fh.readv === 'function') {
+        return await wrapWithAbortSignal(fh.readv(buffers, pos), signal);
+      }
+      let totalBytes = 0;
+      let currentPos = pos !== null && pos !== undefined && pos >= 0 ? pos : null;
+      for (const b of buffers) {
+        const { bytesRead } = await wrapWithAbortSignal(fh.read(b, 0, b.length, currentPos), signal);
+        totalBytes += bytesRead;
+        if (currentPos !== null) currentPos += bytesRead;
+        if (bytesRead < b.length) break;
+      }
+      return { bytesRead: totalBytes, buffers };
+    } finally {
+      await fh.close().catch(() => {});
+    }
+  }
+
+  if (backend.type === 'worker') {
+    const res = await wrapWithAbortSignal(
+      getWorkerPool().exec('readv', [normalized, buffers, pos]),
+      signal
+    );
+    if (res && res.buffers) {
+      for (let i = 0; i < Math.min(buffers.length, res.buffers.length); i++) {
+        const src = res.buffers[i];
+        const dst = buffers[i];
+        Buffer.from(src.buffer, src.byteOffset, src.byteLength).copy(dst);
+      }
+      return { bytesRead: res.bytesRead, buffers };
+    }
+    return { bytesRead: res, buffers };
+  }
+
+  const bytesRead = await wrapWithAbortSignal(
+    native.readv(normalized, buffers, pos !== null && pos !== undefined ? pos : -1),
+    signal
+  );
+  return { bytesRead, buffers };
+}
+
+/**
+ * Writes data from an array of buffers to a file using vectored I/O (writev).
+ */
+async function writev(filePath, buffers, position = null, options = {}) {
+  let pos = position;
+  let opts = options;
+  if (typeof pos === 'object' && pos !== null) {
+    opts = pos;
+    pos = null;
+  }
+  if (!Array.isArray(buffers)) {
+    const err = new TypeError('The "buffers" argument must be an Array.');
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+  if (pos !== null && pos !== undefined) {
+    if (typeof pos !== 'number') {
+      const err = new TypeError(`The "position" argument must be of type number. Received ${typeof pos}`);
+      err.code = 'ERR_INVALID_ARG_TYPE';
+      throw err;
+    }
+    if (!Number.isInteger(pos) || pos < 0) {
+      const err = new RangeError(`The value of "position" is out of range. It must be an integer >= 0. Received ${pos}`);
+      err.code = 'ERR_OUT_OF_RANGE';
+      throw err;
+    }
+  }
+  if (buffers.length === 0) {
+    return { bytesWritten: 0, buffers };
+  }
+  for (let i = 0; i < buffers.length; i++) {
+    if (!Buffer.isBuffer(buffers[i]) && !(buffers[i] instanceof Uint8Array)) {
+      const err = new TypeError(`buffers[${i}] must be a Buffer or Uint8Array.`);
+      err.code = 'ERR_INVALID_ARG_TYPE';
+      throw err;
+    }
+  }
+
+  const signal = opts?.signal;
+  if (signal && signal.aborted) throw createAbortError(signal);
+
+  const normalized = normalizePath(filePath);
+  const openFlagsStr = opts?.flags || opts?.flag || 'w';
+  const openFlags = parseWriteFlags(openFlagsStr);
+  const fileMode = opts?.mode !== undefined ? opts?.mode : 0o666;
+  const flush = Boolean(opts?.flush);
+
+  const backend = selectExecutionBackend(opts);
+
+  if (backend.type === 'provider') {
+    if (typeof backend.provider.writev === 'function') {
+      return await wrapWithAbortSignal(backend.provider.writev(normalized, buffers, pos, opts), signal);
+    }
+    if (backend.provider !== fsPromises && typeof backend.provider.open !== 'function') {
+      const err = new Error('ERR_METHOD_NOT_IMPLEMENTED: Custom provider does not implement writev or open');
+      err.code = 'ERR_METHOD_NOT_IMPLEMENTED';
+      throw err;
+    }
+    const openFn = backend.provider.open.bind(backend.provider);
+    const openPromise = openFn(normalized, openFlagsStr, fileMode);
+    if (signal) {
+      openPromise.then(
+        (fh) => {
+          if (signal.aborted && fh && typeof fh.close === 'function') {
+            fh.close().catch(() => {});
+          }
+        },
+        () => {}
+      );
+    }
+    const fh = await wrapWithAbortSignal(openPromise, signal);
+    try {
+      let res;
+      if (typeof fh.writev === 'function') {
+        res = await wrapWithAbortSignal(fh.writev(buffers, pos), signal);
+      } else {
+        let totalBytes = 0;
+        let currentPos = pos !== null && pos !== undefined && pos >= 0 ? pos : null;
+        for (const b of buffers) {
+          const { bytesWritten } = await wrapWithAbortSignal(fh.write(b, 0, b.length, currentPos), signal);
+          totalBytes += bytesWritten;
+          if (currentPos !== null) currentPos += bytesWritten;
+        }
+        res = { bytesWritten: totalBytes, buffers };
+      }
+      if (flush && typeof fh.sync === 'function') {
+        await wrapWithAbortSignal(fh.sync(), signal);
+      }
+      return res;
+    } finally {
+      await fh.close().catch(() => {});
+    }
+  }
+
+  if (backend.type === 'worker') {
+    const bytesWritten = await wrapWithAbortSignal(
+      getWorkerPool().exec('writev', [normalized, buffers, pos, openFlags, fileMode, flush]),
+      signal
+    );
+    return { bytesWritten, buffers };
+  }
+
+  const bytesWritten = await wrapWithAbortSignal(
+    native.writev(normalized, buffers, pos !== null && pos !== undefined ? pos : -1, openFlags, fileMode, flush),
+    signal
+  );
+  return { bytesWritten, buffers };
+}
+
+/**
+ * Preallocates disk space for a file via io_uring fallocate.
+ */
+async function fallocate(filePath, offset, length, mode = 0, options = {}) {
+  let fallocMode = mode;
+  let opts = options;
+  if (typeof fallocMode === 'object' && fallocMode !== null) {
+    opts = fallocMode;
+    fallocMode = 0;
+  }
+  if (typeof offset !== 'number') {
+    const err = new TypeError(`The "offset" argument must be of type number. Received ${typeof offset}`);
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+  if (!Number.isInteger(offset) || offset < 0) {
+    const err = new RangeError(`The value of "offset" is out of range. It must be an integer >= 0. Received ${offset}`);
+    err.code = 'ERR_OUT_OF_RANGE';
+    throw err;
+  }
+  if (typeof length !== 'number') {
+    const err = new TypeError(`The "length" argument must be of type number. Received ${typeof length}`);
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+  if (!Number.isInteger(length) || length < 0) {
+    const err = new RangeError(`The value of "length" is out of range. It must be an integer >= 0. Received ${length}`);
+    err.code = 'ERR_OUT_OF_RANGE';
+    throw err;
+  }
+  if (fallocMode !== undefined && fallocMode !== null) {
+    if (typeof fallocMode !== 'number') {
+      const err = new TypeError(`The "mode" argument must be of type number. Received ${typeof fallocMode}`);
+      err.code = 'ERR_INVALID_ARG_TYPE';
+      throw err;
+    }
+    if (!Number.isInteger(fallocMode) || fallocMode < 0) {
+      const err = new RangeError(`The value of "mode" is out of range. Received ${fallocMode}`);
+      err.code = 'ERR_OUT_OF_RANGE';
+      throw err;
+    }
+  }
+
+  const signal = opts?.signal;
+  if (signal && signal.aborted) throw createAbortError(signal);
+
+  const normalized = normalizePath(filePath);
+  const backend = selectExecutionBackend(opts);
+
+  if (backend.type === 'provider') {
+    if (typeof backend.provider.fallocate === 'function') {
+      return await wrapWithAbortSignal(backend.provider.fallocate(normalized, offset, length, fallocMode), signal);
+    }
+    if (backend.provider !== fsPromises && typeof backend.provider.open !== 'function') {
+      const err = new Error('ERR_METHOD_NOT_IMPLEMENTED: Custom provider does not implement fallocate or open');
+      err.code = 'ERR_METHOD_NOT_IMPLEMENTED';
+      throw err;
+    }
+    const openFn = backend.provider.open.bind(backend.provider);
+    const openWithGuard = (flag) => {
+      const p = openFn(normalized, flag);
+      if (signal) {
+        p.then(
+          (h) => {
+            if (signal.aborted && h && typeof h.close === 'function') {
+              h.close().catch(() => {});
+            }
+          },
+          () => {}
+        );
+      }
+      return wrapWithAbortSignal(p, signal);
+    };
+    let fh;
+    try {
+      fh = await openWithGuard('r+');
+    } catch (e) {
+      if (e.code === 'ENOENT') {
+        fh = await openWithGuard('w+');
+      } else {
+        throw e;
+      }
+    }
+    try {
+      const st = await wrapWithAbortSignal(fh.stat(), signal);
+      if (st && typeof st.isDirectory === 'function' && st.isDirectory()) {
+        throw createErrnoError('EISDIR', 'fallocate', normalized);
+      }
+      if (offset + length > st.size && (fallocMode & FALLOC_FL_KEEP_SIZE) === 0) {
+        await wrapWithAbortSignal(fh.truncate(offset + length), signal);
+      }
+      return;
+    } finally {
+      await fh.close().catch(() => {});
+    }
+  }
+
+  if (backend.type === 'worker') {
+    await wrapWithAbortSignal(
+      getWorkerPool().exec('fallocate', [normalized, offset, length, fallocMode]),
+      signal
+    );
+    return;
+  }
+
+  await wrapWithAbortSignal(
+    native.fallocate(normalized, offset, length, fallocMode),
+    signal
+  );
+}
+
+/**
+ * Pre-declares access pattern hints for a file via io_uring fadvise (or POSIX fadvise).
+ */
+async function fadvise(filePath, offset, length, advice, options = {}) {
+  let fadviseAdvice = advice;
+  let opts = options;
+  if (typeof fadviseAdvice === 'object' && fadviseAdvice !== null) {
+    opts = fadviseAdvice;
+    fadviseAdvice = POSIX_FADV_NORMAL;
+  }
+  if (typeof offset !== 'number') {
+    const err = new TypeError(`The "offset" argument must be of type number. Received ${typeof offset}`);
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+  if (!Number.isInteger(offset) || offset < 0) {
+    const err = new RangeError(`The value of "offset" is out of range. It must be an integer >= 0. Received ${offset}`);
+    err.code = 'ERR_OUT_OF_RANGE';
+    throw err;
+  }
+  if (typeof length !== 'number') {
+    const err = new TypeError(`The "length" argument must be of type number. Received ${typeof length}`);
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+  if (!Number.isInteger(length) || length < 0) {
+    const err = new RangeError(`The value of "length" is out of range. It must be an integer >= 0. Received ${length}`);
+    err.code = 'ERR_OUT_OF_RANGE';
+    throw err;
+  }
+  if (typeof fadviseAdvice !== 'number') {
+    const err = new TypeError(`The "advice" argument must be of type number. Received ${typeof fadviseAdvice}`);
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+  if (!Number.isInteger(fadviseAdvice) || fadviseAdvice < 0) {
+    const err = new RangeError(`The value of "advice" is out of range. Received ${fadviseAdvice}`);
+    err.code = 'ERR_OUT_OF_RANGE';
+    throw err;
+  }
+
+  const signal = opts?.signal;
+  if (signal && signal.aborted) throw createAbortError(signal);
+
+  const normalized = normalizePath(filePath);
+  const backend = selectExecutionBackend(opts);
+
+  if (backend.type === 'provider') {
+    if (typeof backend.provider.fadvise === 'function') {
+      return await wrapWithAbortSignal(backend.provider.fadvise(normalized, offset, length, fadviseAdvice), signal);
+    }
+    if (backend.provider !== fsPromises && typeof backend.provider.open !== 'function') {
+      const err = new Error('ERR_METHOD_NOT_IMPLEMENTED: Custom provider does not implement fadvise or open');
+      err.code = 'ERR_METHOD_NOT_IMPLEMENTED';
+      throw err;
+    }
+    const openFn = backend.provider.open.bind(backend.provider);
+    const fh = await wrapWithAbortSignal(openFn(normalized, 'r'), signal);
+    try {
+      return;
+    } finally {
+      await fh.close().catch(() => {});
+    }
+  }
+
+  if (backend.type === 'worker') {
+    await wrapWithAbortSignal(
+      getWorkerPool().exec('fadvise', [normalized, offset, length, fadviseAdvice]),
+      signal
+    );
+    return;
+  }
+
+  await wrapWithAbortSignal(
+    native.fadvise(normalized, offset, length, fadviseAdvice),
+    signal
+  );
+}
+
+/**
+ * Opens a file and returns a persistent UringFileHandle with pinned descriptor.
+ */
+async function open(filePath, flags = 'r', mode = 0o666, options = {}) {
+  let openFlagsStr = flags;
+  let fileMode = mode;
+  let opts = options;
+
+  if (typeof openFlagsStr === 'object' && openFlagsStr !== null) {
+    opts = openFlagsStr;
+    openFlagsStr = opts.flags || opts.flag || 'r';
+    fileMode = opts.mode !== undefined ? opts.mode : 0o666;
+  } else if (typeof fileMode === 'object' && fileMode !== null) {
+    opts = fileMode;
+    fileMode = opts.mode !== undefined ? opts.mode : 0o666;
+  }
+
+  const numericOpenFlags = parseOpenFlags(openFlagsStr);
+  const normalized = normalizePath(filePath);
+  const signal = opts?.signal;
+  if (signal && signal.aborted) throw createAbortError(signal);
+
+  const backend = selectExecutionBackend(opts);
+
+  if (backend.type === 'provider' || backend.type === 'worker') {
+    if (backend.type === 'provider' && backend.provider !== fsPromises && typeof backend.provider.open !== 'function') {
+      const err = new Error('ERR_METHOD_NOT_IMPLEMENTED: Custom provider does not implement open');
+      err.code = 'ERR_METHOD_NOT_IMPLEMENTED';
+      throw err;
+    }
+    const openFn = (backend.type === 'provider' && typeof backend.provider.open === 'function')
+      ? backend.provider.open.bind(backend.provider)
+      : fsPromises.open;
+    const openPromise = openFn(normalized, openFlagsStr, fileMode);
+    if (signal) {
+      openPromise.then(
+        (fh) => {
+          if (signal.aborted && fh && typeof fh.close === 'function') {
+            fh.close().catch(() => {});
+          }
+        },
+        () => {}
+      );
+    }
+    const nodeHandle = await wrapWithAbortSignal(openPromise, signal);
+    return new UringFileHandle(backend.type, normalized, numericOpenFlags, fileMode, null, nodeHandle);
+  }
+
+  const openPromise = native.openHandle(normalized, numericOpenFlags, fileMode);
+  if (signal) {
+    openPromise.then(
+      (desc) => {
+        if (signal.aborted && desc) {
+          native.fhClose(desc.fd, desc.directSlot).catch(() => {});
+        }
+      },
+      () => {}
+    );
+  }
+  const desc = await wrapWithAbortSignal(openPromise, signal);
+  return new UringFileHandle('io_uring', normalized, numericOpenFlags, fileMode, desc, null);
+}
+
+const constants = Object.assign({}, fsConstants, {
+  FALLOC_FL_KEEP_SIZE,
+  FALLOC_FL_PUNCH_HOLE,
+  FALLOC_FL_COLLAPSE_RANGE,
+  FALLOC_FL_ZERO_RANGE,
+  FALLOC_FL_INSERT_RANGE,
+  FALLOC_FL_UNSHARE_RANGE,
+  POSIX_FADV_NORMAL,
+  POSIX_FADV_RANDOM,
+  POSIX_FADV_SEQUENTIAL,
+  POSIX_FADV_WILLNEED,
+  POSIX_FADV_DONTNEED,
+  POSIX_FADV_NOREUSE,
+});
+
 module.exports = {
+  open,
+  UringFileHandle,
+  readBatchAt,
+  readv,
+  writev,
+  fallocate,
+  fadvise,
+  FALLOC_FL_KEEP_SIZE,
+  FALLOC_FL_PUNCH_HOLE,
+  FALLOC_FL_COLLAPSE_RANGE,
+  FALLOC_FL_ZERO_RANGE,
+  FALLOC_FL_INSERT_RANGE,
+  FALLOC_FL_UNSHARE_RANGE,
+  POSIX_FADV_NORMAL,
+  POSIX_FADV_RANDOM,
+  POSIX_FADV_SEQUENTIAL,
+  POSIX_FADV_WILLNEED,
+  POSIX_FADV_DONTNEED,
+  POSIX_FADV_NOREUSE,
   readFile,
   readAt,
   writeFile,
@@ -1114,7 +2458,7 @@ module.exports = {
   setOptimisticReadSize,
   closeFallbackWorkers,
   UringStats,
-  constants: fsConstants,
+  constants,
   F_OK: fsConstants.F_OK,
   R_OK: fsConstants.R_OK,
   W_OK: fsConstants.W_OK,

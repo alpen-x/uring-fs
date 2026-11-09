@@ -5,6 +5,38 @@ All notable changes to `uring-fs` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-11-09
+
+### Added
+- **Batched Positional Reads (`readBatchAt(filePath, ranges, options?)`):**
+  - Read multiple byte ranges from a file in a single kernel roundtrip via linked direct descriptor SQEs (`1 + N + 1` SQEs: `openat_direct -> N * read -> close_direct`).
+  - Supports slices defined as `[offset, length]` or `{ offset, length }`.
+  - Automatic unlinked single-FD fallback for large batches (>30 slices) or when direct descriptor slots are exhausted.
+  - EOF clamping, 0-byte slice handling, string encodings, `AbortSignal`, and 100% parity across `worker` and `node:fs` fallbacks.
+- **Persistent `UringFileHandle` via `open(filePath, flags?, mode?, options?)`:**
+  - Pinned direct descriptor (`direct_slot`) or POSIX fd with 1-SQE per operation, bypassing descriptor open/close cycles for extreme throughput.
+  - Dedicated 1-SQE operations: `fh.read`, `fh.readAt`, `fh.readBatchAt`, `fh.write`, `fh.writeAt`, `fh.readv`, `fh.writev`, `fh.sync`, `fh.datasync`, `fh.stat`, `fh.fallocate`, and `fh.close`.
+  - Full support for `[Symbol.asyncDispose]()` (`await using fh = await open(...)`).
+  - Enforced `EBADF` checks on closed handles and zero descriptor/direct-slot leaks.
+- **Vectored Scatter/Gather I/O (`readv` and `writev`):**
+  - High-performance scatter reads (`readv(filePath, buffers, position?, options?)`) and gather writes (`writev(filePath, buffers, position?, options?)`).
+  - Available both as top-level functions and as 1-SQE methods on `UringFileHandle`.
+  - Resolves with `{ bytesRead, buffers }` / `{ bytesWritten, buffers }` matching Node.js `FileHandle` conventions.
+  - Seamless support across `io_uring`, dedicated worker threads, and `node:fs` fallbacks.
+- **Disk Space Pre-allocation (`fallocate(filePath, offset, length, mode?, options?)`):**
+  - Direct kernel disk allocation via `io_uring_prep_fallocate` without userspace write loops.
+  - Available both top-level and on `UringFileHandle`.
+  - Exported `FALLOC_FL_*` constants (`FALLOC_FL_KEEP_SIZE`, `FALLOC_FL_PUNCH_HOLE`, `FALLOC_FL_COLLAPSE_RANGE`, `FALLOC_FL_ZERO_RANGE`, `FALLOC_FL_INSERT_RANGE`, `FALLOC_FL_UNSHARE_RANGE`).
+  - Cross-platform size extension fallback via `ftruncate` on non-io_uring platforms.
+- **File Pre-declaration Access Pattern Hints (`fadvise(filePath, offset, length, advice, options?)`):**
+  - Native kernel `IORING_OP_FADVISE` (`io_uring_prep_fadvise`) execution (top-level 3-SQE linked chain and 1-SQE on `UringFileHandle`).
+  - Exported `POSIX_FADV_*` constants (`POSIX_FADV_NORMAL`, `POSIX_FADV_RANDOM`, `POSIX_FADV_SEQUENTIAL`, `POSIX_FADV_WILLNEED`, `POSIX_FADV_DONTNEED`, `POSIX_FADV_NOREUSE`).
+  - Seamless support across `io_uring`, worker pool, and `node:fs` fallbacks with `ENOENT` and `EBADF` parity.
+
+### Fixed
+- Fixed `fh.readAt(offset, 0)` returning 1 byte instead of 0 bytes across `io_uring`, `worker`, and `node:fs`.
+- Fixed `fh.write(string, encoding)` 2-argument signature to properly interpret encoding and return `{ bytesWritten, buffer: string }` matching Node.js `FileHandle.write`.
+
 ## [1.2.2] - 2026-11-09
 
 ### Fixed & Hardened

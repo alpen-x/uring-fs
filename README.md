@@ -73,6 +73,12 @@ sudo pacman -S liburing base-devel
 
 ```js
 import {
+  open,
+  readBatchAt,
+  readv,
+  writev,
+  fallocate,
+  fadvise,
   readFile,
   readAt,
   writeFile,
@@ -93,6 +99,7 @@ import {
   isUringSupported,
   getRingStats,
   configure,
+  POSIX_FADV_WILLNEED,
 } from 'uring-fs';
 
 console.log('io_uring active:', isUringSupported());
@@ -119,6 +126,36 @@ console.log(getRingStats());
 await unlink('hello.link');
 await unlink('hello_renamed.txt');
 await unlink('hello.txt');
+
+// 1. Batched Positional Reads (readBatchAt) in 1 kernel roundtrip:
+const slices = await readBatchAt('weights.bin', [
+  [0, 1024],
+  { offset: 4096, length: 512 },
+  [8192, 2048],
+]);
+
+// 2. Persistent UringFileHandle (1-SQE operations, Symbol.asyncDispose):
+{
+  await using fh = await open('data.bin', 'r+');
+  await fh.write(Buffer.from('Header'), 0, 6, 0); // Exactly 1 SQE!
+  const { bytesRead } = await fh.read(Buffer.alloc(6), 0, 6, 0);
+  const st = await fh.stat();
+  await fh.sync();
+  // Automatically closed on scope exit with zero descriptor leaks!
+}
+
+// 3. Vectored Scatter/Gather I/O (readv & writev):
+await writev('network_log.bin', [
+  Buffer.from('HTTP/1.1 200 OK\r\n'),
+  Buffer.from('Content-Type: text/plain\r\n\r\n'),
+  Buffer.from('Payload body'),
+]);
+
+// 4. Disk Pre-allocation (fallocate):
+await fallocate('large_database.db', 0, 1024 * 1024 * 1024); // 1 GB preallocated
+
+// 5. Pre-declare Access Pattern Hints (fadvise):
+await fadvise('large_database.db', 0, 1024 * 1024 * 1024, POSIX_FADV_WILLNEED);
 ```
 
 ---
@@ -127,6 +164,12 @@ await unlink('hello.txt');
 
 | Function | Kernel `io_uring` Opcode(s) | Description |
 | :--- | :--- | :--- |
+| `readBatchAt(path, ranges, options?)` | `OPENAT_DIRECT` ➔ `N * READ` ➔ `CLOSE_DIRECT` *(`IOSQE_IO_LINK`)* | Batched positional read of multiple ranges in a single kernel roundtrip |
+| `readv(path, buffers, position?, options?)` | `OPENAT_DIRECT` ➔ `READV` ➔ `CLOSE_DIRECT` *(`IOSQE_IO_LINK`)* | Vectored scatter read into multiple buffers |
+| `writev(path, buffers, position?, options?)` | `OPENAT_DIRECT` ➔ `WRITEV` ➔ `CLOSE_DIRECT` *(`IOSQE_IO_LINK`)* | Vectored gather write from multiple buffers |
+| `fallocate(path, offset, length, mode?, options?)` | `OPENAT_DIRECT` ➔ `FALLOCATE` ➔ `CLOSE_DIRECT` *(`IOSQE_IO_LINK`)* | Direct disk space pre-allocation |
+| `fadvise(path, offset, length, advice, options?)` | `OPENAT_DIRECT` ➔ `FADVISE` ➔ `CLOSE_DIRECT` *(`IOSQE_IO_LINK`)* | Pre-declares access pattern hints (`POSIX_FADV_*`) for page cache management |
+| `open(path, flags?, mode?, options?)` | `OPENAT_DIRECT` *(1-SQE)* | Opens a file returning a persistent `UringFileHandle` with 1-SQE ops |
 | `readFile(path, options?)` | `OPENAT_DIRECT` ➔ `READ` ➔ `CLOSE_DIRECT` *(Optimistic <64KB)*<br>`OPENAT_DIRECT` ➔ `STATX` ➔ `READ` ➔ `CLOSE_DIRECT` *(Large)* | Reads entire file with configurable `optimisticReadSize` and zero-copy V8 handoff |
 | `readAt(path, offset, length, options?)` | `OPENAT_DIRECT` ➔ `READ` ➔ `CLOSE_DIRECT` *(`IOSQE_IO_HARDLINK`)* | Reads exact file slice at byte offset without thread pool or file table overhead |
 | `writeFile(path, data, options?)` | `OPENAT_DIRECT` ➔ `WRITE` (➔ `FSYNC`) ➔ `CLOSE_DIRECT` *(`IOSQE_IO_LINK`)* | Writes `string`, `Buffer`, or `Uint8Array` in a single linked kernel chain |

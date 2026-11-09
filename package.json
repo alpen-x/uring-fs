@@ -1,6 +1,6 @@
 {
   "name": "uring-fs",
-  "version": "1.2.2",
+  "version": "1.3.0",
   "description": "True asynchronous Linux io_uring filesystem I/O for Node.js with zero libuv thread-pool usage, automatic tick batching, and pluggable fallback backends.",
   "main": "index.js",
   "module": "index.mjs",
@@ -19,7 +19,8 @@
     "lib/worker_fallback.js",
     "binding.gyp",
     "src/addon.cc",
-    "src/addon_stub.cc"
+    "src/addon_stub.cc",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "install": "node-gyp rebuild",

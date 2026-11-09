@@ -7,6 +7,11 @@ export interface CustomFsProvider {
   open?: (path: string, flags?: string, mode?: number) => Promise<any>;
   readFile: (path: string, options?: any) => Promise<Buffer | string>;
   readAt?: (path: string, offset: number, length: number, options?: any) => Promise<Buffer | string>;
+  readBatchAt?: (path: string, ranges: any[], options?: any) => Promise<any[]>;
+  readv?: (path: string, buffers: any[], position?: number | null) => Promise<any>;
+  writev?: (path: string, buffers: any[], position?: number | null, options?: any) => Promise<any>;
+  fallocate?: (path: string, offset: number, length: number, mode?: number) => Promise<void>;
+  fadvise?: (path: string, offset: number, length: number, advice: number) => Promise<void>;
   writeFile: (path: string, data: any, options?: any) => Promise<void>;
   appendFile?: (path: string, data: any, options?: any) => Promise<void>;
   copyFile?: (src: string, dest: string, mode?: number) => Promise<void>;
@@ -30,6 +35,155 @@ export type FallbackStrategy =
   | boolean
   | CustomFsProvider
   | { promises: CustomFsProvider };
+
+export type BatchSliceRange =
+  | { offset: number; length: number }
+  | [number, number];
+
+export interface UringReadBatchOptions extends UringCommonOptions {
+  encoding?: BufferEncoding | null;
+}
+
+export interface UringReadvOptions extends UringCommonOptions {}
+
+export interface UringWritevOptions extends UringCommonOptions {
+  flag?: string | number;
+  flags?: string | number;
+  mode?: number;
+  flush?: boolean;
+}
+
+export interface UringFallocateOptions extends UringCommonOptions {}
+
+export interface UringFadviseOptions extends UringCommonOptions {}
+
+export interface UringOpenOptions extends UringCommonOptions {
+  flag?: string | number;
+  flags?: string | number;
+  mode?: number;
+}
+
+export interface ReadvResult<T extends NodeJS.ArrayBufferView[] = NodeJS.ArrayBufferView[]> {
+  bytesRead: number;
+  buffers: T;
+}
+
+export interface WritevResult<T extends NodeJS.ArrayBufferView[] = NodeJS.ArrayBufferView[]> {
+  bytesWritten: number;
+  buffers: T;
+}
+
+export interface ReadHandleResult<T extends NodeJS.ArrayBufferView = NodeJS.ArrayBufferView> {
+  bytesRead: number;
+  buffer: T;
+}
+
+export interface WriteHandleResult<T = NodeJS.ArrayBufferView | string> {
+  bytesWritten: number;
+  buffer: T;
+}
+
+export class UringFileHandle {
+  readonly fd: number;
+  readonly directSlot: number;
+  readonly closed: boolean;
+
+  read<T extends NodeJS.ArrayBufferView>(
+    buffer?: T,
+    offset?: number,
+    length?: number,
+    position?: number | null
+  ): Promise<ReadHandleResult<T>>;
+  read<T extends NodeJS.ArrayBufferView = Buffer>(
+    options?: {
+      buffer?: T;
+      offset?: number;
+      length?: number;
+      position?: number | null;
+    }
+  ): Promise<ReadHandleResult<T>>;
+
+  readAt(
+    offset: number,
+    length: number,
+    options?: { encoding?: null; signal?: AbortSignal } | null
+  ): Promise<Buffer>;
+  readAt(
+    offset: number,
+    length: number,
+    options: BufferEncoding | { encoding: BufferEncoding; signal?: AbortSignal }
+  ): Promise<string>;
+  readAt(
+    offset: number,
+    length: number,
+    options?: BufferEncoding | UringReadAtOptions | null
+  ): Promise<Buffer | string>;
+
+  readBatchAt(
+    ranges: BatchSliceRange[],
+    options?: { encoding?: null; signal?: AbortSignal } | null
+  ): Promise<Buffer[]>;
+  readBatchAt(
+    ranges: BatchSliceRange[],
+    options: BufferEncoding | { encoding: BufferEncoding; signal?: AbortSignal }
+  ): Promise<string[]>;
+  readBatchAt(
+    ranges: BatchSliceRange[],
+    options?: BufferEncoding | UringReadBatchOptions | null
+  ): Promise<(Buffer | string)[]>;
+
+  write<T extends NodeJS.ArrayBufferView>(
+    buffer: T,
+    offset?: number,
+    length?: number,
+    position?: number | null
+  ): Promise<WriteHandleResult<T>>;
+  write(
+    string: string,
+    position?: number | null,
+    encoding?: BufferEncoding | null
+  ): Promise<WriteHandleResult<string>>;
+  write(
+    string: string,
+    encoding?: BufferEncoding | null
+  ): Promise<WriteHandleResult<string>>;
+
+  writeAt(
+    buffer: NodeJS.ArrayBufferView | string,
+    position?: number | null
+  ): Promise<number>;
+
+  readv<T extends NodeJS.ArrayBufferView[]>(
+    buffers: T,
+    position?: number | null
+  ): Promise<ReadvResult<T>>;
+
+  writev<T extends NodeJS.ArrayBufferView[]>(
+    buffers: T,
+    position?: number | null
+  ): Promise<WritevResult<T>>;
+
+  sync(): Promise<void>;
+  datasync(): Promise<void>;
+
+  fallocate(
+    offset: number,
+    length: number,
+    mode?: number
+  ): Promise<void>;
+
+  fadvise(
+    offset: number,
+    length: number,
+    advice: number
+  ): Promise<void>;
+
+  stat(options?: UringCommonOptions): Promise<UringStats>;
+
+  close(): Promise<void>;
+
+  [Symbol.asyncDispose](): Promise<void>;
+}
 
 export interface UringCommonOptions {
   /**
@@ -272,7 +426,87 @@ export function configure(options?: UringFsConfig): {
 };
 export function setOptimisticReadSize(bytes: number): number;
 export function closeFallbackWorkers(): Promise<void>;
-export const constants: typeof import('node:fs').constants;
+export function readBatchAt(
+  path: PathLike,
+  ranges: BatchSliceRange[],
+  options?: { encoding?: null; signal?: AbortSignal; strict?: boolean; fallback?: FallbackStrategy } | null
+): Promise<Buffer[]>;
+export function readBatchAt(
+  path: PathLike,
+  ranges: BatchSliceRange[],
+  options: BufferEncoding | { encoding: BufferEncoding; signal?: AbortSignal; strict?: boolean; fallback?: FallbackStrategy }
+): Promise<string[]>;
+export function readBatchAt(
+  path: PathLike,
+  ranges: BatchSliceRange[],
+  options?: BufferEncoding | UringReadBatchOptions | null
+): Promise<(Buffer | string)[]>;
+
+export function readv<T extends NodeJS.ArrayBufferView[]>(
+  path: PathLike,
+  buffers: T,
+  position?: number | null | UringReadvOptions,
+  options?: UringReadvOptions
+): Promise<ReadvResult<T>>;
+
+export function writev<T extends NodeJS.ArrayBufferView[]>(
+  path: PathLike,
+  buffers: T,
+  position?: number | null | UringWritevOptions,
+  options?: UringWritevOptions
+): Promise<WritevResult<T>>;
+
+export function fallocate(
+  path: PathLike,
+  offset: number,
+  length: number,
+  mode?: number | UringFallocateOptions,
+  options?: UringFallocateOptions
+): Promise<void>;
+
+export function fadvise(
+  path: PathLike,
+  offset: number,
+  length: number,
+  advice: number,
+  options?: UringFadviseOptions
+): Promise<void>;
+
+export function open(
+  path: PathLike,
+  flags?: string | number | UringOpenOptions,
+  mode?: number | UringOpenOptions,
+  options?: UringOpenOptions
+): Promise<UringFileHandle>;
+
+export const FALLOC_FL_KEEP_SIZE: number;
+export const FALLOC_FL_PUNCH_HOLE: number;
+export const FALLOC_FL_COLLAPSE_RANGE: number;
+export const FALLOC_FL_ZERO_RANGE: number;
+export const FALLOC_FL_INSERT_RANGE: number;
+export const FALLOC_FL_UNSHARE_RANGE: number;
+
+export const POSIX_FADV_NORMAL: number;
+export const POSIX_FADV_RANDOM: number;
+export const POSIX_FADV_SEQUENTIAL: number;
+export const POSIX_FADV_WILLNEED: number;
+export const POSIX_FADV_DONTNEED: number;
+export const POSIX_FADV_NOREUSE: number;
+
+export const constants: typeof import('node:fs').constants & {
+  FALLOC_FL_KEEP_SIZE: number;
+  FALLOC_FL_PUNCH_HOLE: number;
+  FALLOC_FL_COLLAPSE_RANGE: number;
+  FALLOC_FL_ZERO_RANGE: number;
+  FALLOC_FL_INSERT_RANGE: number;
+  FALLOC_FL_UNSHARE_RANGE: number;
+  POSIX_FADV_NORMAL: number;
+  POSIX_FADV_RANDOM: number;
+  POSIX_FADV_SEQUENTIAL: number;
+  POSIX_FADV_WILLNEED: number;
+  POSIX_FADV_DONTNEED: number;
+  POSIX_FADV_NOREUSE: number;
+};
 export const F_OK: number;
 export const R_OK: number;
 export const W_OK: number;
@@ -280,6 +514,25 @@ export const X_OK: number;
 export const COPYFILE_EXCL: number;
 
 declare const _default: {
+  open: typeof open;
+  UringFileHandle: typeof UringFileHandle;
+  readBatchAt: typeof readBatchAt;
+  readv: typeof readv;
+  writev: typeof writev;
+  fallocate: typeof fallocate;
+  fadvise: typeof fadvise;
+  FALLOC_FL_KEEP_SIZE: typeof FALLOC_FL_KEEP_SIZE;
+  FALLOC_FL_PUNCH_HOLE: typeof FALLOC_FL_PUNCH_HOLE;
+  FALLOC_FL_COLLAPSE_RANGE: typeof FALLOC_FL_COLLAPSE_RANGE;
+  FALLOC_FL_ZERO_RANGE: typeof FALLOC_FL_ZERO_RANGE;
+  FALLOC_FL_INSERT_RANGE: typeof FALLOC_FL_INSERT_RANGE;
+  FALLOC_FL_UNSHARE_RANGE: typeof FALLOC_FL_UNSHARE_RANGE;
+  POSIX_FADV_NORMAL: typeof POSIX_FADV_NORMAL;
+  POSIX_FADV_RANDOM: typeof POSIX_FADV_RANDOM;
+  POSIX_FADV_SEQUENTIAL: typeof POSIX_FADV_SEQUENTIAL;
+  POSIX_FADV_WILLNEED: typeof POSIX_FADV_WILLNEED;
+  POSIX_FADV_DONTNEED: typeof POSIX_FADV_DONTNEED;
+  POSIX_FADV_NOREUSE: typeof POSIX_FADV_NOREUSE;
   readFile: typeof readFile;
   readAt: typeof readAt;
   writeFile: typeof writeFile;

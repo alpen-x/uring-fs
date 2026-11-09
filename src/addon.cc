@@ -9,6 +9,8 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/uio.h>
+#include <linux/falloc.h>
 #include <string>
 #include <cstring>
 #include <cstdlib>
@@ -17,6 +19,44 @@
 #include <vector>
 #ifdef __GLIBC__
 #include <malloc.h>
+#endif
+
+#ifndef FALLOC_FL_KEEP_SIZE
+#define FALLOC_FL_KEEP_SIZE 0x01
+#endif
+#ifndef FALLOC_FL_PUNCH_HOLE
+#define FALLOC_FL_PUNCH_HOLE 0x02
+#endif
+#ifndef FALLOC_FL_COLLAPSE_RANGE
+#define FALLOC_FL_COLLAPSE_RANGE 0x08
+#endif
+#ifndef FALLOC_FL_ZERO_RANGE
+#define FALLOC_FL_ZERO_RANGE 0x10
+#endif
+#ifndef FALLOC_FL_INSERT_RANGE
+#define FALLOC_FL_INSERT_RANGE 0x20
+#endif
+#ifndef FALLOC_FL_UNSHARE_RANGE
+#define FALLOC_FL_UNSHARE_RANGE 0x40
+#endif
+
+#ifndef POSIX_FADV_NORMAL
+#define POSIX_FADV_NORMAL 0
+#endif
+#ifndef POSIX_FADV_RANDOM
+#define POSIX_FADV_RANDOM 1
+#endif
+#ifndef POSIX_FADV_SEQUENTIAL
+#define POSIX_FADV_SEQUENTIAL 2
+#endif
+#ifndef POSIX_FADV_WILLNEED
+#define POSIX_FADV_WILLNEED 3
+#endif
+#ifndef POSIX_FADV_DONTNEED
+#define POSIX_FADV_DONTNEED 4
+#endif
+#ifndef POSIX_FADV_NOREUSE
+#define POSIX_FADV_NOREUSE 5
 #endif
 
 #define DEFAULT_QUEUE_DEPTH 512
@@ -33,6 +73,21 @@
 enum OperationType {
     OP_READ_FILE,
     OP_READ_AT,
+    OP_READ_BATCH_AT,
+    OP_READV,
+    OP_WRITEV,
+    OP_FALLOCATE,
+    OP_FADVISE,
+    OP_FH_OPEN,
+    OP_FH_READ,
+    OP_FH_READ_AT,
+    OP_FH_WRITE,
+    OP_FH_READV,
+    OP_FH_WRITEV,
+    OP_FH_FSYNC,
+    OP_FH_FALLOCATE,
+    OP_FH_FADVISE,
+    OP_FH_CLOSE,
     OP_WRITE_FILE,
     OP_COPY_FILE,
     OP_STAT,
@@ -49,11 +104,16 @@ enum OperationType {
 
 enum RequestStage {
     STAGE_OPEN,
+    STAGE_OPEN_DIRECT,
     STAGE_STATX,
     STAGE_OPEN_DEST,
     STAGE_READ,
     STAGE_READ_DIRECT_PAIR2,
+    STAGE_READV,
     STAGE_WRITE,
+    STAGE_WRITEV,
+    STAGE_FALLOCATE,
+    STAGE_FADVISE,
     STAGE_COPY_SPLICE_IN,
     STAGE_COPY_SPLICE_OUT,
     STAGE_FSYNC,
@@ -71,10 +131,14 @@ static struct io_uring ring;
 static bool ring_supported = false;
 static bool direct_fds_supported = false;
 static std::vector<int> direct_fd_free_list;
+static bool direct_slot_allocated[DIRECT_FD_TABLE_SIZE] = { false };
 static size_t default_optimistic_read_size = DEFAULT_OPTIMISTIC_READ_SIZE;
 
 static void InitDirectFdTable() {
     direct_fd_free_list.clear();
+    for (int i = 0; i < DIRECT_FD_TABLE_SIZE; ++i) {
+        direct_slot_allocated[i] = false;
+    }
     if (!ring_supported) {
         direct_fds_supported = false;
         return;
@@ -97,12 +161,16 @@ static int AllocateDirectSlot() {
     }
     int slot = direct_fd_free_list.back();
     direct_fd_free_list.pop_back();
+    direct_slot_allocated[slot] = true;
     return slot;
 }
 
 static void FreeDirectSlot(int slot) {
     if (slot >= 0 && slot < DIRECT_FD_TABLE_SIZE) {
-        direct_fd_free_list.push_back(slot);
+        if (direct_slot_allocated[slot]) {
+            direct_slot_allocated[slot] = false;
+            direct_fd_free_list.push_back(slot);
+        }
     }
 }
 
@@ -144,6 +212,13 @@ static void ReleaseReadBuffer(char* buf, size_t capacity) {
     }
 }
 
+struct BatchSlice {
+    uint64_t file_offset;
+    size_t size;
+    size_t bytes_read;
+    char* buffer;
+};
+
 struct IORequest {
     Napi::Env env;
     Napi::Promise::Deferred deferred;
@@ -168,6 +243,9 @@ struct IORequest {
     int linked_stage_index;
     bool open_succeeded;
 
+    bool owns_descriptor;
+    bool buffer_is_external;
+
     bool optimistic_read;
     size_t optimistic_read_size;
 
@@ -182,6 +260,14 @@ struct IORequest {
     uint64_t file_offset;
     size_t write_offset;
     size_t splice_in_pipe;
+
+    int falloc_mode;
+    int fadvise_advice;
+    std::vector<struct iovec> iovecs;
+    std::vector<Napi::Reference<Napi::Object>> iovec_refs;
+
+    std::vector<BatchSlice> batch_slices;
+    size_t current_slice_idx;
 
     int saved_errno;
     const char* failed_syscall;
@@ -206,6 +292,8 @@ struct IORequest {
           pending_linked_cqes(0),
           linked_stage_index(0),
           open_succeeded(false),
+          owns_descriptor(true),
+          buffer_is_external(false),
           optimistic_read(false),
           optimistic_read_size(0),
           buffer(nullptr),
@@ -216,6 +304,9 @@ struct IORequest {
           file_offset(0),
           write_offset(0),
           splice_in_pipe(0),
+          falloc_mode(0),
+          fadvise_advice(0),
+          current_slice_idx(0),
           saved_errno(0),
           failed_syscall(nullptr) {
         pipefd[0] = -1;
@@ -226,23 +317,38 @@ struct IORequest {
     }
 
     ~IORequest() {
-        if (direct_slot >= 0) {
-            FreeDirectSlot(direct_slot);
-            direct_slot = -1;
-        }
-        if (fd >= 0) {
-            close(fd);
-            fd = -1;
+        if (owns_descriptor) {
+            if (direct_slot >= 0) {
+                FreeDirectSlot(direct_slot);
+                direct_slot = -1;
+            }
+            if (fd >= 0) {
+                close(fd);
+                fd = -1;
+            }
         }
         if (dest_fd >= 0) {
             close(dest_fd);
             dest_fd = -1;
         }
-        if (buffer) {
+        if (buffer && !buffer_is_external) {
             ReleaseReadBuffer(buffer, buffer_capacity);
             buffer = nullptr;
             buffer_capacity = 0;
         }
+        for (auto& s : batch_slices) {
+            if (s.buffer) {
+                std::free(s.buffer);
+                s.buffer = nullptr;
+            }
+        }
+        batch_slices.clear();
+        for (auto& ref : iovec_refs) {
+            if (!ref.IsEmpty()) {
+                ref.Reset();
+            }
+        }
+        iovec_refs.clear();
         if (pipefd[0] >= 0) {
             close(pipefd[0]);
             pipefd[0] = -1;
@@ -337,6 +443,11 @@ static void PrepSqeForRequest(struct io_uring_sqe* sqe, IORequest* req) {
         case STAGE_OPEN:
             io_uring_prep_openat(sqe, AT_FDCWD, req->path.c_str(), req->open_flags | O_CLOEXEC, req->mode);
             break;
+        case STAGE_OPEN_DIRECT: {
+            int open_flags = req->open_flags & ~O_CLOEXEC;
+            io_uring_prep_openat_direct(sqe, AT_FDCWD, req->path.c_str(), open_flags, req->mode, req->direct_slot);
+            break;
+        }
         case STAGE_OPEN_DEST: {
             int dflags = O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC;
             if (req->copy_flags & 1) { // COPYFILE_EXCL (UV_FS_COPYFILE_EXCL = 1)
@@ -364,10 +475,12 @@ static void PrepSqeForRequest(struct io_uring_sqe* sqe, IORequest* req) {
         case STAGE_READ: {
             size_t remaining = req->size - req->offset;
             unsigned int chunk = remaining > MAX_IO_CHUNK ? static_cast<unsigned int>(MAX_IO_CHUNK) : static_cast<unsigned int>(remaining);
-            if (chunk == 0 && req->op == OP_READ_AT) {
+            if (chunk == 0 && (req->op == OP_READ_AT || req->op == OP_FH_READ_AT || req->op == OP_READ_BATCH_AT)) {
                 chunk = 1;
             }
-            uint64_t read_offset = req->file_offset + req->offset;
+            uint64_t read_offset = (req->file_offset == static_cast<uint64_t>(-1))
+                ? static_cast<uint64_t>(-1)
+                : (req->file_offset + req->offset);
             if (req->direct_slot >= 0) {
                 io_uring_prep_read(sqe, req->direct_slot, req->buffer + req->offset, chunk, read_offset);
                 sqe->flags |= IOSQE_FIXED_FILE;
@@ -378,16 +491,53 @@ static void PrepSqeForRequest(struct io_uring_sqe* sqe, IORequest* req) {
         }
         case STAGE_READ_DIRECT_PAIR2:
             break;
+        case STAGE_READV: {
+            int target = (req->direct_slot >= 0) ? req->direct_slot : req->fd;
+            io_uring_prep_readv(sqe, target, req->iovecs.data(), req->iovecs.size(), req->file_offset);
+            if (req->direct_slot >= 0) {
+                sqe->flags |= IOSQE_FIXED_FILE;
+            }
+            break;
+        }
         case STAGE_WRITE: {
             size_t remaining = req->size - req->offset;
             unsigned int chunk = remaining > MAX_IO_CHUNK ? static_cast<unsigned int>(MAX_IO_CHUNK) : static_cast<unsigned int>(remaining);
-            uint64_t write_offset = (req->open_flags & O_APPEND) ? static_cast<uint64_t>(-1) : req->offset;
+            uint64_t write_offset = (req->open_flags & O_APPEND || req->file_offset == static_cast<uint64_t>(-1))
+                ? static_cast<uint64_t>(-1)
+                : (req->file_offset + req->offset);
             if (req->direct_slot >= 0 && req->op != OP_COPY_FILE) {
                 io_uring_prep_write(sqe, req->direct_slot, req->write_ptr + req->offset, chunk, write_offset);
                 sqe->flags |= IOSQE_FIXED_FILE;
             } else {
                 int target_fd = (req->op == OP_COPY_FILE) ? req->dest_fd : req->fd;
                 io_uring_prep_write(sqe, target_fd, req->write_ptr + req->offset, chunk, write_offset);
+            }
+            break;
+        }
+        case STAGE_WRITEV: {
+            int target = (req->direct_slot >= 0) ? req->direct_slot : req->fd;
+            uint64_t write_offset = (req->open_flags & O_APPEND || req->file_offset == static_cast<uint64_t>(-1))
+                ? static_cast<uint64_t>(-1)
+                : req->file_offset;
+            io_uring_prep_writev(sqe, target, req->iovecs.data(), req->iovecs.size(), write_offset);
+            if (req->direct_slot >= 0) {
+                sqe->flags |= IOSQE_FIXED_FILE;
+            }
+            break;
+        }
+        case STAGE_FALLOCATE: {
+            int target = (req->direct_slot >= 0) ? req->direct_slot : req->fd;
+            io_uring_prep_fallocate(sqe, target, req->falloc_mode, req->file_offset, req->size);
+            if (req->direct_slot >= 0) {
+                sqe->flags |= IOSQE_FIXED_FILE;
+            }
+            break;
+        }
+        case STAGE_FADVISE: {
+            int target = (req->direct_slot >= 0) ? req->direct_slot : req->fd;
+            io_uring_prep_fadvise(sqe, target, req->file_offset, static_cast<off_t>(req->size), req->fadvise_advice);
+            if (req->direct_slot >= 0) {
+                sqe->flags |= IOSQE_FIXED_FILE;
             }
             break;
         }
@@ -588,7 +738,7 @@ static bool TryScheduleLinkedWrite(IORequest* req) {
 
             struct io_uring_sqe* sqe1 = io_uring_get_sqe(&ring);
             io_uring_prep_fsync(sqe1, slot, req->fsync_flags);
-            sqe1->flags |= IOSQE_FIXED_FILE | IOSQE_IO_LINK;
+            sqe1->flags |= IOSQE_FIXED_FILE | IOSQE_IO_HARDLINK;
             io_uring_sqe_set_data(sqe1, req);
 
             struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
@@ -604,7 +754,7 @@ static bool TryScheduleLinkedWrite(IORequest* req) {
 
             struct io_uring_sqe* sqe1 = io_uring_get_sqe(&ring);
             io_uring_prep_write(sqe1, slot, req->write_ptr, req->size, write_offset);
-            sqe1->flags |= IOSQE_FIXED_FILE | IOSQE_IO_LINK;
+            sqe1->flags |= IOSQE_FIXED_FILE | IOSQE_IO_HARDLINK;
             io_uring_sqe_set_data(sqe1, req);
 
             struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
@@ -618,12 +768,12 @@ static bool TryScheduleLinkedWrite(IORequest* req) {
 
             struct io_uring_sqe* sqe1 = io_uring_get_sqe(&ring);
             io_uring_prep_write(sqe1, slot, req->write_ptr, req->size, write_offset);
-            sqe1->flags |= IOSQE_FIXED_FILE | IOSQE_IO_LINK;
+            sqe1->flags |= IOSQE_FIXED_FILE | IOSQE_IO_HARDLINK;
             io_uring_sqe_set_data(sqe1, req);
 
             struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
             io_uring_prep_fsync(sqe2, slot, req->fsync_flags);
-            sqe2->flags |= IOSQE_FIXED_FILE | IOSQE_IO_LINK;
+            sqe2->flags |= IOSQE_FIXED_FILE | IOSQE_IO_HARDLINK;
             io_uring_sqe_set_data(sqe2, req);
 
             struct io_uring_sqe* sqe3 = io_uring_get_sqe(&ring);
@@ -673,7 +823,7 @@ static bool TryScheduleLinkedFsync(IORequest* req) {
 
     struct io_uring_sqe* sqe1 = io_uring_get_sqe(&ring);
     io_uring_prep_fsync(sqe1, slot, req->fsync_flags);
-    sqe1->flags |= IOSQE_FIXED_FILE | IOSQE_IO_LINK;
+    sqe1->flags |= IOSQE_FIXED_FILE | IOSQE_IO_HARDLINK;
     io_uring_sqe_set_data(sqe1, req);
 
     struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
@@ -855,6 +1005,290 @@ static bool TryScheduleLinkedReadPair2(IORequest* req) {
     return true;
 }
 
+static bool TryScheduleLinkedReadBatchAt(IORequest* req) {
+    if (!direct_fds_supported) return false;
+    if (req->batch_slices.empty() || req->batch_slices.size() > 30) return false;
+    for (const auto& s : req->batch_slices) {
+        if (s.size > MAX_IO_CHUNK) return false;
+    }
+
+    uint32_t needed = 1 + static_cast<uint32_t>(req->batch_slices.size()) + 1;
+    if (in_flight_sqes + needed > stats.queue_depth) {
+        return false;
+    }
+    if (io_uring_sq_space_left(&ring) < needed && unsubmitted_sqes > 0) {
+        FlushSubmissions();
+    }
+    if (io_uring_sq_space_left(&ring) < needed) {
+        return false;
+    }
+
+    int slot = AllocateDirectSlot();
+    if (slot < 0) {
+        return false;
+    }
+
+    for (size_t i = 0; i < req->batch_slices.size(); ++i) {
+        size_t alloc_sz = req->batch_slices[i].size > 0 ? req->batch_slices[i].size : 1;
+        req->batch_slices[i].buffer = static_cast<char*>(std::malloc(alloc_sz));
+        if (!req->batch_slices[i].buffer) {
+            for (size_t j = 0; j < i; ++j) {
+                std::free(req->batch_slices[j].buffer);
+                req->batch_slices[j].buffer = nullptr;
+            }
+            FreeDirectSlot(slot);
+            return false;
+        }
+    }
+
+    req->direct_slot = slot;
+    req->is_linked_chain = true;
+    req->pending_linked_cqes = needed;
+    req->linked_stage_index = 0;
+    req->open_succeeded = false;
+
+    int open_flags = req->open_flags & ~O_CLOEXEC;
+
+    struct io_uring_sqe* sqe0 = io_uring_get_sqe(&ring);
+    io_uring_prep_openat_direct(sqe0, AT_FDCWD, req->path.c_str(), open_flags, req->mode, slot);
+    sqe0->flags |= IOSQE_IO_LINK;
+    io_uring_sqe_set_data(sqe0, req);
+
+    for (size_t i = 0; i < req->batch_slices.size(); ++i) {
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+        unsigned int chunk = req->batch_slices[i].size > 0 ? static_cast<unsigned int>(req->batch_slices[i].size) : 1;
+        io_uring_prep_read(sqe, slot, req->batch_slices[i].buffer, chunk, req->batch_slices[i].file_offset);
+        sqe->flags |= IOSQE_FIXED_FILE | IOSQE_IO_HARDLINK;
+        io_uring_sqe_set_data(sqe, req);
+    }
+
+    struct io_uring_sqe* sqe_last = io_uring_get_sqe(&ring);
+    io_uring_prep_close_direct(sqe_last, slot);
+    io_uring_sqe_set_data(sqe_last, req);
+
+    unsubmitted_sqes += needed;
+    in_flight_sqes += needed;
+    stats.total_sqes_prepared += needed;
+    StartFlushHooks();
+    return true;
+}
+
+static bool TryScheduleLinkedReadv(IORequest* req) {
+    if (!direct_fds_supported) return false;
+
+    uint32_t needed = 3;
+    if (in_flight_sqes + needed > stats.queue_depth) {
+        return false;
+    }
+    if (io_uring_sq_space_left(&ring) < needed && unsubmitted_sqes > 0) {
+        FlushSubmissions();
+    }
+    if (io_uring_sq_space_left(&ring) < needed) {
+        return false;
+    }
+
+    int slot = AllocateDirectSlot();
+    if (slot < 0) {
+        return false;
+    }
+
+    req->direct_slot = slot;
+    req->is_linked_chain = true;
+    req->pending_linked_cqes = needed;
+    req->linked_stage_index = 0;
+    req->open_succeeded = false;
+
+    int open_flags = req->open_flags & ~O_CLOEXEC;
+
+    struct io_uring_sqe* sqe0 = io_uring_get_sqe(&ring);
+    io_uring_prep_openat_direct(sqe0, AT_FDCWD, req->path.c_str(), open_flags, req->mode, slot);
+    sqe0->flags |= IOSQE_IO_LINK;
+    io_uring_sqe_set_data(sqe0, req);
+
+    struct io_uring_sqe* sqe1 = io_uring_get_sqe(&ring);
+    io_uring_prep_readv(sqe1, slot, req->iovecs.data(), req->iovecs.size(), req->file_offset);
+    sqe1->flags |= IOSQE_FIXED_FILE | IOSQE_IO_HARDLINK;
+    io_uring_sqe_set_data(sqe1, req);
+
+    struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
+    io_uring_prep_close_direct(sqe2, slot);
+    io_uring_sqe_set_data(sqe2, req);
+
+    unsubmitted_sqes += needed;
+    in_flight_sqes += needed;
+    stats.total_sqes_prepared += needed;
+    StartFlushHooks();
+    return true;
+}
+
+static bool TryScheduleLinkedWritev(IORequest* req) {
+    if (!direct_fds_supported) return false;
+
+    uint32_t needed = req->flush_after_write ? 4 : 3;
+    if (in_flight_sqes + needed > stats.queue_depth) {
+        return false;
+    }
+    if (io_uring_sq_space_left(&ring) < needed && unsubmitted_sqes > 0) {
+        FlushSubmissions();
+    }
+    if (io_uring_sq_space_left(&ring) < needed) {
+        return false;
+    }
+
+    int slot = AllocateDirectSlot();
+    if (slot < 0) {
+        return false;
+    }
+
+    req->direct_slot = slot;
+    req->is_linked_chain = true;
+    req->pending_linked_cqes = needed;
+    req->linked_stage_index = 0;
+    req->open_succeeded = false;
+
+    int open_flags = req->open_flags & ~O_CLOEXEC;
+    uint64_t write_offset = (req->open_flags & O_APPEND || req->file_offset == static_cast<uint64_t>(-1))
+        ? static_cast<uint64_t>(-1)
+        : req->file_offset;
+
+    if (!req->flush_after_write) {
+        struct io_uring_sqe* sqe0 = io_uring_get_sqe(&ring);
+        io_uring_prep_openat_direct(sqe0, AT_FDCWD, req->path.c_str(), open_flags, req->mode, slot);
+        sqe0->flags |= IOSQE_IO_LINK;
+        io_uring_sqe_set_data(sqe0, req);
+
+        struct io_uring_sqe* sqe1 = io_uring_get_sqe(&ring);
+        io_uring_prep_writev(sqe1, slot, req->iovecs.data(), req->iovecs.size(), write_offset);
+        sqe1->flags |= IOSQE_FIXED_FILE | IOSQE_IO_HARDLINK;
+        io_uring_sqe_set_data(sqe1, req);
+
+        struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
+        io_uring_prep_close_direct(sqe2, slot);
+        io_uring_sqe_set_data(sqe2, req);
+    } else {
+        struct io_uring_sqe* sqe0 = io_uring_get_sqe(&ring);
+        io_uring_prep_openat_direct(sqe0, AT_FDCWD, req->path.c_str(), open_flags, req->mode, slot);
+        sqe0->flags |= IOSQE_IO_LINK;
+        io_uring_sqe_set_data(sqe0, req);
+
+        struct io_uring_sqe* sqe1 = io_uring_get_sqe(&ring);
+        io_uring_prep_writev(sqe1, slot, req->iovecs.data(), req->iovecs.size(), write_offset);
+        sqe1->flags |= IOSQE_FIXED_FILE | IOSQE_IO_HARDLINK;
+        io_uring_sqe_set_data(sqe1, req);
+
+        struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
+        io_uring_prep_fsync(sqe2, slot, req->fsync_flags);
+        sqe2->flags |= IOSQE_FIXED_FILE | IOSQE_IO_HARDLINK;
+        io_uring_sqe_set_data(sqe2, req);
+
+        struct io_uring_sqe* sqe3 = io_uring_get_sqe(&ring);
+        io_uring_prep_close_direct(sqe3, slot);
+        io_uring_sqe_set_data(sqe3, req);
+    }
+
+    unsubmitted_sqes += needed;
+    in_flight_sqes += needed;
+    stats.total_sqes_prepared += needed;
+    StartFlushHooks();
+    return true;
+}
+
+static bool TryScheduleLinkedFallocate(IORequest* req) {
+    if (!direct_fds_supported) return false;
+
+    uint32_t needed = 3;
+    if (in_flight_sqes + needed > stats.queue_depth) {
+        return false;
+    }
+    if (io_uring_sq_space_left(&ring) < needed && unsubmitted_sqes > 0) {
+        FlushSubmissions();
+    }
+    if (io_uring_sq_space_left(&ring) < needed) {
+        return false;
+    }
+
+    int slot = AllocateDirectSlot();
+    if (slot < 0) {
+        return false;
+    }
+
+    req->direct_slot = slot;
+    req->is_linked_chain = true;
+    req->pending_linked_cqes = needed;
+    req->linked_stage_index = 0;
+    req->open_succeeded = false;
+
+    int open_flags = req->open_flags & ~O_CLOEXEC;
+
+    struct io_uring_sqe* sqe0 = io_uring_get_sqe(&ring);
+    io_uring_prep_openat_direct(sqe0, AT_FDCWD, req->path.c_str(), open_flags, req->mode, slot);
+    sqe0->flags |= IOSQE_IO_LINK;
+    io_uring_sqe_set_data(sqe0, req);
+
+    struct io_uring_sqe* sqe1 = io_uring_get_sqe(&ring);
+    io_uring_prep_fallocate(sqe1, slot, req->falloc_mode, req->file_offset, req->size);
+    sqe1->flags |= IOSQE_FIXED_FILE | IOSQE_IO_HARDLINK;
+    io_uring_sqe_set_data(sqe1, req);
+
+    struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
+    io_uring_prep_close_direct(sqe2, slot);
+    io_uring_sqe_set_data(sqe2, req);
+
+    unsubmitted_sqes += needed;
+    in_flight_sqes += needed;
+    stats.total_sqes_prepared += needed;
+    StartFlushHooks();
+    return true;
+}
+
+static bool TryScheduleLinkedFadvise(IORequest* req) {
+    if (!direct_fds_supported) return false;
+
+    uint32_t needed = 3;
+    if (in_flight_sqes + needed > stats.queue_depth) {
+        return false;
+    }
+    if (io_uring_sq_space_left(&ring) < needed && unsubmitted_sqes > 0) {
+        FlushSubmissions();
+    }
+    if (io_uring_sq_space_left(&ring) < needed) {
+        return false;
+    }
+
+    int slot = AllocateDirectSlot();
+    if (slot < 0) {
+        return false;
+    }
+
+    req->direct_slot = slot;
+    req->is_linked_chain = true;
+    req->pending_linked_cqes = needed;
+    req->linked_stage_index = 0;
+    req->open_succeeded = false;
+
+    int open_flags = req->open_flags & ~O_CLOEXEC;
+
+    struct io_uring_sqe* sqe0 = io_uring_get_sqe(&ring);
+    io_uring_prep_openat_direct(sqe0, AT_FDCWD, req->path.c_str(), open_flags, req->mode, slot);
+    sqe0->flags |= IOSQE_IO_LINK;
+    io_uring_sqe_set_data(sqe0, req);
+
+    struct io_uring_sqe* sqe1 = io_uring_get_sqe(&ring);
+    io_uring_prep_fadvise(sqe1, slot, req->file_offset, static_cast<off_t>(req->size), req->fadvise_advice);
+    sqe1->flags |= IOSQE_FIXED_FILE | IOSQE_IO_HARDLINK;
+    io_uring_sqe_set_data(sqe1, req);
+
+    struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
+    io_uring_prep_close_direct(sqe2, slot);
+    io_uring_sqe_set_data(sqe2, req);
+
+    unsubmitted_sqes += needed;
+    in_flight_sqes += needed;
+    stats.total_sqes_prepared += needed;
+    StartFlushHooks();
+    return true;
+}
+
 static void ScheduleStage(IORequest* req) {
     if (req->stage == STAGE_READ_DIRECT_PAIR2) {
         if (pending_pair2_queue.empty() && TryScheduleLinkedReadPair2(req)) {
@@ -895,6 +1329,16 @@ static void ScheduleStage(IORequest* req) {
                 if (TryScheduleLinkedReadPair1(req)) return;
             } else if (req->op == OP_READ_AT) {
                 if (TryScheduleLinkedReadAt(req)) return;
+            } else if (req->op == OP_READ_BATCH_AT) {
+                if (TryScheduleLinkedReadBatchAt(req)) return;
+            } else if (req->op == OP_READV) {
+                if (TryScheduleLinkedReadv(req)) return;
+            } else if (req->op == OP_WRITEV) {
+                if (TryScheduleLinkedWritev(req)) return;
+            } else if (req->op == OP_FALLOCATE) {
+                if (TryScheduleLinkedFallocate(req)) return;
+            } else if (req->op == OP_FADVISE) {
+                if (TryScheduleLinkedFadvise(req)) return;
             }
         }
 
@@ -984,6 +1428,46 @@ static void DrainPendingQueue() {
                 if (direct_fds_supported && req->size <= MAX_IO_CHUNK) {
                     break;
                 }
+            } else if (req->op == OP_READ_BATCH_AT) {
+                if (TryScheduleLinkedReadBatchAt(req)) {
+                    pending_queue.pop_front();
+                    continue;
+                }
+                if (direct_fds_supported && req->batch_slices.size() <= 30) {
+                    break;
+                }
+            } else if (req->op == OP_READV) {
+                if (TryScheduleLinkedReadv(req)) {
+                    pending_queue.pop_front();
+                    continue;
+                }
+                if (direct_fds_supported) {
+                    break;
+                }
+            } else if (req->op == OP_WRITEV) {
+                if (TryScheduleLinkedWritev(req)) {
+                    pending_queue.pop_front();
+                    continue;
+                }
+                if (direct_fds_supported) {
+                    break;
+                }
+            } else if (req->op == OP_FALLOCATE) {
+                if (TryScheduleLinkedFallocate(req)) {
+                    pending_queue.pop_front();
+                    continue;
+                }
+                if (direct_fds_supported) {
+                    break;
+                }
+            } else if (req->op == OP_FADVISE) {
+                if (TryScheduleLinkedFadvise(req)) {
+                    pending_queue.pop_front();
+                    continue;
+                }
+                if (direct_fds_supported) {
+                    break;
+                }
             }
         }
 
@@ -1068,6 +1552,7 @@ static bool EnsureCredentialsSafe(Napi::Env env) {
         ring_supported = false;
         direct_fds_supported = false;
         direct_fd_free_list.clear();
+        for (int i = 0; i < DIRECT_FD_TABLE_SIZE; ++i) direct_slot_allocated[i] = false;
         unsupported_reason = std::string("Failed to reinitialize io_uring after UID/GID change: ") + uv_strerror(ret);
         return false;
     }
@@ -1554,9 +2039,185 @@ static void ProcessCompletions() {
                     }
                     continue;
                 }
+                if (req->op == OP_READ_BATCH_AT) {
+                    if (cqe_idx == 0) {
+                        if (res < 0) {
+                            req->saved_errno = -res;
+                            req->failed_syscall = "open";
+                        } else {
+                            req->open_succeeded = true;
+                        }
+                    } else if (cqe_idx <= static_cast<int>(req->batch_slices.size())) {
+                        size_t slice_idx = cqe_idx - 1;
+                        if (res < 0) {
+                            if (req->saved_errno == 0 && -res != ECANCELED) {
+                                req->saved_errno = -res;
+                                req->failed_syscall = "read";
+                            }
+                        } else {
+                            req->batch_slices[slice_idx].bytes_read = (req->batch_slices[slice_idx].size == 0) ? 0 : static_cast<size_t>(res);
+                        }
+                    } else {
+                        if (res < 0 && req->saved_errno == 0 && -res != ECANCELED) {
+                            req->saved_errno = -res;
+                            req->failed_syscall = "close";
+                        }
+                    }
+
+                    if (req->pending_linked_cqes == 0) {
+                        req->is_linked_chain = false;
+                        FreeDirectSlot(req->direct_slot);
+                        req->direct_slot = -1;
+                        finished_requests.push_back(req);
+                    }
+                    continue;
+                }
+
+                if (req->op == OP_READV) {
+                    if (cqe_idx == 0) {
+                        if (res < 0) {
+                            req->saved_errno = -res;
+                            req->failed_syscall = "open";
+                        } else {
+                            req->open_succeeded = true;
+                        }
+                    } else if (cqe_idx == 1) {
+                        if (res < 0) {
+                            if (req->saved_errno == 0 && -res != ECANCELED) {
+                                req->saved_errno = -res;
+                                req->failed_syscall = "readv";
+                            }
+                        } else {
+                            req->size = static_cast<size_t>(res);
+                        }
+                    } else if (cqe_idx == 2) {
+                        if (res < 0 && req->saved_errno == 0 && -res != ECANCELED) {
+                            req->saved_errno = -res;
+                            req->failed_syscall = "close";
+                        }
+                    }
+
+                    if (req->pending_linked_cqes == 0) {
+                        req->is_linked_chain = false;
+                        FreeDirectSlot(req->direct_slot);
+                        req->direct_slot = -1;
+                        finished_requests.push_back(req);
+                    }
+                    continue;
+                }
+
+                if (req->op == OP_WRITEV) {
+                    if (cqe_idx == 0) {
+                        if (res < 0) {
+                            req->saved_errno = -res;
+                            req->failed_syscall = "open";
+                        } else {
+                            req->open_succeeded = true;
+                        }
+                    } else if (cqe_idx == 1) {
+                        if (res < 0) {
+                            if (req->saved_errno == 0 && -res != ECANCELED) {
+                                req->saved_errno = -res;
+                                req->failed_syscall = "writev";
+                            }
+                        } else {
+                            req->size = static_cast<size_t>(res);
+                        }
+                    } else if (req->flush_after_write && cqe_idx == 2) {
+                        if (res < 0 && req->saved_errno == 0 && -res != ECANCELED) {
+                            req->saved_errno = -res;
+                            req->failed_syscall = (req->fsync_flags & IORING_FSYNC_DATASYNC) ? "fdatasync" : "fsync";
+                        }
+                    } else {
+                        if (res < 0 && req->saved_errno == 0 && -res != ECANCELED) {
+                            req->saved_errno = -res;
+                            req->failed_syscall = "close";
+                        }
+                    }
+
+                    if (req->pending_linked_cqes == 0) {
+                        req->is_linked_chain = false;
+                        FreeDirectSlot(req->direct_slot);
+                        req->direct_slot = -1;
+                        finished_requests.push_back(req);
+                    }
+                    continue;
+                }
+
+                if (req->op == OP_FALLOCATE) {
+                    if (cqe_idx == 0) {
+                        if (res < 0) {
+                            req->saved_errno = -res;
+                            req->failed_syscall = "open";
+                        } else {
+                            req->open_succeeded = true;
+                        }
+                    } else if (cqe_idx == 1) {
+                        if (res < 0 && req->saved_errno == 0 && -res != ECANCELED) {
+                            req->saved_errno = -res;
+                            req->failed_syscall = "fallocate";
+                        }
+                    } else if (cqe_idx == 2) {
+                        if (res < 0 && req->saved_errno == 0 && -res != ECANCELED) {
+                            req->saved_errno = -res;
+                            req->failed_syscall = "close";
+                        }
+                    }
+
+                    if (req->pending_linked_cqes == 0) {
+                        req->is_linked_chain = false;
+                        FreeDirectSlot(req->direct_slot);
+                        req->direct_slot = -1;
+                        finished_requests.push_back(req);
+                    }
+                    continue;
+                }
+
+                if (req->op == OP_FADVISE) {
+                    if (cqe_idx == 0) {
+                        if (res < 0) {
+                            req->saved_errno = -res;
+                            req->failed_syscall = "open";
+                        } else {
+                            req->open_succeeded = true;
+                        }
+                    } else if (cqe_idx == 1) {
+                        if (res < 0 && req->saved_errno == 0 && -res != ECANCELED) {
+                            req->saved_errno = -res;
+                            req->failed_syscall = "fadvise";
+                        }
+                    } else if (cqe_idx == 2) {
+                        if (res < 0 && req->saved_errno == 0 && -res != ECANCELED) {
+                            req->saved_errno = -res;
+                            req->failed_syscall = "close";
+                        }
+                    }
+
+                    if (req->pending_linked_cqes == 0) {
+                        req->is_linked_chain = false;
+                        FreeDirectSlot(req->direct_slot);
+                        req->direct_slot = -1;
+                        finished_requests.push_back(req);
+                    }
+                    continue;
+                }
             }
 
             switch (req->stage) {
+                case STAGE_OPEN_DIRECT: {
+                    if (res < 0) {
+                        req->saved_errno = -res;
+                        req->failed_syscall = "open";
+                        FreeDirectSlot(req->direct_slot);
+                        req->direct_slot = -1;
+                    } else {
+                        req->open_succeeded = true;
+                        req->owns_descriptor = false;
+                    }
+                    finished_requests.push_back(req);
+                    break;
+                }
+
                 case STAGE_OPEN: {
                     if (res < 0) {
                         req->saved_errno = -res;
@@ -1621,6 +2282,39 @@ static void ProcessCompletions() {
                                 req->stage = STAGE_WRITE;
                                 ScheduleStage(req);
                             }
+                        } else if (req->op == OP_FH_OPEN) {
+                            req->owns_descriptor = false;
+                            finished_requests.push_back(req);
+                        } else if (req->op == OP_READ_BATCH_AT) {
+                            if (req->batch_slices.empty()) {
+                                EnqueueAsyncClose(req->fd);
+                                req->fd = -1;
+                                finished_requests.push_back(req);
+                            } else {
+                                req->current_slice_idx = 0;
+                                auto& s = req->batch_slices[0];
+                                s.buffer = static_cast<char*>(std::malloc(s.size > 0 ? s.size : 1));
+                                req->buffer = s.buffer;
+                                req->buffer_capacity = s.size > 0 ? s.size : 1;
+                                req->buffer_is_external = true;
+                                req->size = s.size;
+                                req->offset = 0;
+                                req->file_offset = s.file_offset;
+                                req->stage = STAGE_READ;
+                                ScheduleStage(req);
+                            }
+                        } else if (req->op == OP_READV) {
+                            req->stage = STAGE_READV;
+                            ScheduleStage(req);
+                        } else if (req->op == OP_WRITEV) {
+                            req->stage = STAGE_WRITEV;
+                            ScheduleStage(req);
+                        } else if (req->op == OP_FALLOCATE) {
+                            req->stage = STAGE_FALLOCATE;
+                            ScheduleStage(req);
+                        } else if (req->op == OP_FADVISE) {
+                            req->stage = STAGE_FADVISE;
+                            ScheduleStage(req);
                         }
                     }
                     break;
@@ -1900,6 +2594,16 @@ static void ProcessCompletions() {
                         } else {
                             req->saved_errno = -res;
                             req->failed_syscall = (req->op == OP_COPY_FILE) ? "copyfile" : "read";
+                            if (req->op == OP_FH_READ || req->op == OP_FH_READ_AT) {
+                                finished_requests.push_back(req);
+                                break;
+                            }
+                            if (req->op == OP_READ_BATCH_AT) {
+                                EnqueueAsyncClose(req->fd);
+                                req->fd = -1;
+                                finished_requests.push_back(req);
+                                break;
+                            }
                             if (req->direct_slot >= 0) {
                                 EnqueueAsyncCloseDirect(req->direct_slot);
                                 req->direct_slot = -1;
@@ -1912,6 +2616,41 @@ static void ProcessCompletions() {
                                 req->dest_fd = -1;
                             }
                             finished_requests.push_back(req);
+                        }
+                    } else if (req->op == OP_FH_READ) {
+                        req->size = static_cast<size_t>(res);
+                        finished_requests.push_back(req);
+                    } else if (req->op == OP_FH_READ_AT) {
+                        req->size = (req->size == 0) ? 0 : static_cast<size_t>(res);
+                        finished_requests.push_back(req);
+                    } else if (req->op == OP_READ_BATCH_AT) {
+                        if (res > 0 && req->size > 0) {
+                            req->offset += static_cast<size_t>(res);
+                            if (req->offset > req->size) {
+                                req->offset = req->size;
+                            }
+                        }
+                        if (res > 0 && req->offset < req->size) {
+                            ScheduleStage(req);
+                        } else {
+                            req->batch_slices[req->current_slice_idx].bytes_read = req->size > 0 ? req->offset : 0;
+                            req->current_slice_idx++;
+                            if (req->current_slice_idx < req->batch_slices.size()) {
+                                auto& s = req->batch_slices[req->current_slice_idx];
+                                s.buffer = static_cast<char*>(std::malloc(s.size > 0 ? s.size : 1));
+                                req->buffer = s.buffer;
+                                req->buffer_capacity = s.size > 0 ? s.size : 1;
+                                req->buffer_is_external = true;
+                                req->size = s.size;
+                                req->offset = 0;
+                                req->file_offset = s.file_offset;
+                                ScheduleStage(req);
+                            } else {
+                                EnqueueAsyncClose(req->fd);
+                                req->fd = -1;
+                                req->buffer = nullptr;
+                                finished_requests.push_back(req);
+                            }
                         }
                     } else if (req->optimistic_read) {
                         req->offset += static_cast<size_t>(res);
@@ -1982,6 +2721,10 @@ static void ProcessCompletions() {
                         } else {
                             req->saved_errno = -res;
                             req->failed_syscall = (req->op == OP_COPY_FILE) ? "copyfile" : "write";
+                            if (req->op == OP_FH_WRITE) {
+                                finished_requests.push_back(req);
+                                break;
+                            }
                             if (req->op == OP_COPY_FILE) {
                                 req->fd = req->dest_fd;
                                 req->dest_fd = -1;
@@ -1989,6 +2732,9 @@ static void ProcessCompletions() {
                             req->stage = (req->direct_slot >= 0) ? STAGE_CLOSE_DIRECT : STAGE_CLOSE;
                             ScheduleStage(req);
                         }
+                    } else if (req->op == OP_FH_WRITE) {
+                        req->size = static_cast<size_t>(res);
+                        finished_requests.push_back(req);
                     } else {
                         if (req->size > 0) {
                             req->offset += static_cast<size_t>(res);
@@ -2009,13 +2755,121 @@ static void ProcessCompletions() {
                     break;
                 }
 
+                case STAGE_READV: {
+                    if (res < 0) {
+                        if (-res == EINTR || -res == EAGAIN) {
+                            ScheduleStage(req);
+                        } else {
+                            req->saved_errno = -res;
+                            req->failed_syscall = "readv";
+                            if (req->op == OP_FH_READV) {
+                                finished_requests.push_back(req);
+                            } else {
+                                req->stage = (req->direct_slot >= 0) ? STAGE_CLOSE_DIRECT : STAGE_CLOSE;
+                                ScheduleStage(req);
+                            }
+                        }
+                    } else {
+                        req->size = static_cast<size_t>(res);
+                        if (req->op == OP_FH_READV) {
+                            finished_requests.push_back(req);
+                        } else {
+                            req->stage = (req->direct_slot >= 0) ? STAGE_CLOSE_DIRECT : STAGE_CLOSE;
+                            ScheduleStage(req);
+                        }
+                    }
+                    break;
+                }
+
+                case STAGE_WRITEV: {
+                    if (res < 0) {
+                        if (-res == EINTR || -res == EAGAIN) {
+                            ScheduleStage(req);
+                        } else {
+                            req->saved_errno = -res;
+                            req->failed_syscall = "writev";
+                            if (req->op == OP_FH_WRITEV) {
+                                finished_requests.push_back(req);
+                            } else {
+                                req->stage = (req->direct_slot >= 0) ? STAGE_CLOSE_DIRECT : STAGE_CLOSE;
+                                ScheduleStage(req);
+                            }
+                        }
+                    } else {
+                        req->size = static_cast<size_t>(res);
+                        if (req->op == OP_FH_WRITEV) {
+                            finished_requests.push_back(req);
+                        } else {
+                            req->stage = req->flush_after_write
+                                ? STAGE_FSYNC
+                                : ((req->direct_slot >= 0) ? STAGE_CLOSE_DIRECT : STAGE_CLOSE);
+                            ScheduleStage(req);
+                        }
+                    }
+                    break;
+                }
+
+                case STAGE_FALLOCATE: {
+                    if (res < 0) {
+                        if (-res == EINTR || -res == EAGAIN) {
+                            ScheduleStage(req);
+                        } else {
+                            req->saved_errno = -res;
+                            req->failed_syscall = "fallocate";
+                            if (req->op == OP_FH_FALLOCATE) {
+                                finished_requests.push_back(req);
+                            } else {
+                                req->stage = (req->direct_slot >= 0) ? STAGE_CLOSE_DIRECT : STAGE_CLOSE;
+                                ScheduleStage(req);
+                            }
+                        }
+                    } else {
+                        if (req->op == OP_FH_FALLOCATE) {
+                            finished_requests.push_back(req);
+                        } else {
+                            req->stage = (req->direct_slot >= 0) ? STAGE_CLOSE_DIRECT : STAGE_CLOSE;
+                            ScheduleStage(req);
+                        }
+                    }
+                    break;
+                }
+
+                case STAGE_FADVISE: {
+                    if (res < 0) {
+                        if (-res == EINTR || -res == EAGAIN) {
+                            ScheduleStage(req);
+                        } else {
+                            req->saved_errno = -res;
+                            req->failed_syscall = "fadvise";
+                            if (req->op == OP_FH_FADVISE) {
+                                finished_requests.push_back(req);
+                            } else {
+                                req->stage = (req->direct_slot >= 0) ? STAGE_CLOSE_DIRECT : STAGE_CLOSE;
+                                ScheduleStage(req);
+                            }
+                        }
+                    } else {
+                        if (req->op == OP_FH_FADVISE) {
+                            finished_requests.push_back(req);
+                        } else {
+                            req->stage = (req->direct_slot >= 0) ? STAGE_CLOSE_DIRECT : STAGE_CLOSE;
+                            ScheduleStage(req);
+                        }
+                    }
+                    break;
+                }
+
                 case STAGE_FSYNC: {
                     if (res < 0 && req->saved_errno == 0) {
                         req->saved_errno = -res;
                         req->failed_syscall = (req->fsync_flags & IORING_FSYNC_DATASYNC) ? "fdatasync" : "fsync";
                     }
-                    req->stage = (req->direct_slot >= 0) ? STAGE_CLOSE_DIRECT : STAGE_CLOSE;
-                    ScheduleStage(req);
+                    if (req->op == OP_FH_FSYNC) {
+                        finished_requests.push_back(req);
+                    } else {
+                        req->stage = (req->direct_slot >= 0) ? STAGE_CLOSE_DIRECT : STAGE_CLOSE;
+                        ScheduleStage(req);
+                    }
                     break;
                 }
 
@@ -2119,7 +2973,8 @@ static void ProcessCompletions() {
             } else {
                 switch (req->op) {
                     case OP_READ_FILE:
-                    case OP_READ_AT: {
+                    case OP_READ_AT:
+                    case OP_FH_READ_AT: {
                         if (req->size == 0 || !req->buffer) {
                             req->deferred.Resolve(Napi::Buffer<char>::New(req->env, 0));
                         } else if (req->buffer_capacity > 0 && req->buffer_capacity == default_optimistic_read_size && req->size <= default_optimistic_read_size) {
@@ -2146,7 +3001,34 @@ static void ProcessCompletions() {
                         }
                         break;
                     }
-                    case OP_WRITE_FILE: {
+                    case OP_READ_BATCH_AT: {
+                        Napi::Array arr = Napi::Array::New(req->env, req->batch_slices.size());
+                        for (size_t i = 0; i < req->batch_slices.size(); ++i) {
+                            const auto& s = req->batch_slices[i];
+                            if (s.bytes_read == 0 || !s.buffer) {
+                                arr.Set(static_cast<uint32_t>(i), Napi::Buffer<char>::New(req->env, 0));
+                            } else {
+                                Napi::Buffer<char> b = Napi::Buffer<char>::Copy(req->env, s.buffer, s.bytes_read);
+                                arr.Set(static_cast<uint32_t>(i), b);
+                            }
+                        }
+                        req->deferred.Resolve(arr);
+                        break;
+                    }
+                    case OP_FH_OPEN: {
+                        Napi::Object handleObj = Napi::Object::New(req->env);
+                        handleObj.Set("fd", Napi::Number::New(req->env, req->fd));
+                        handleObj.Set("directSlot", Napi::Number::New(req->env, req->direct_slot));
+                        req->deferred.Resolve(handleObj);
+                        break;
+                    }
+                    case OP_WRITE_FILE:
+                    case OP_WRITEV:
+                    case OP_READV:
+                    case OP_FH_READ:
+                    case OP_FH_WRITE:
+                    case OP_FH_READV:
+                    case OP_FH_WRITEV: {
                         req->deferred.Resolve(Napi::Number::New(req->env, static_cast<double>(req->size)));
                         break;
                     }
@@ -2155,6 +3037,12 @@ static void ProcessCompletions() {
                         req->deferred.Resolve(BuildStatObject(req->env, req->stx));
                         break;
                     }
+                    case OP_FALLOCATE:
+                    case OP_FH_FALLOCATE:
+                    case OP_FADVISE:
+                    case OP_FH_FADVISE:
+                    case OP_FH_FSYNC:
+                    case OP_FH_CLOSE:
                     case OP_COPY_FILE:
                     case OP_UNLINK:
                     case OP_RMDIR:
@@ -2676,6 +3564,658 @@ Napi::Value FsyncUring(const Napi::CallbackInfo& info) {
     return promise;
 }
 
+Napi::Value ReadBatchAtUring(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 3 || !info[0].IsString() || !info[1].IsArray() || !info[2].IsArray()) {
+        Napi::TypeError::New(env, "Expected arguments: (path: string, offsets: number[], lengths: number[])").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    std::string filePath = info[0].As<Napi::String>().Utf8Value();
+    Napi::Array offsets = info[1].As<Napi::Array>();
+    Napi::Array lengths = info[2].As<Napi::Array>();
+    uint32_t count = offsets.Length();
+
+    if (count == 0) {
+        Napi::Promise::Deferred def = Napi::Promise::Deferred::New(env);
+        def.Resolve(Napi::Array::New(env, 0));
+        return def.Promise();
+    }
+
+    IORequest* req = new IORequest(env, OP_READ_BATCH_AT, STAGE_OPEN, filePath);
+    req->open_flags = O_RDONLY;
+    req->batch_slices.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        BatchSlice slice;
+        slice.file_offset = offsets.Get(i).As<Napi::Number>().Int64Value();
+        slice.size = lengths.Get(i).As<Napi::Number>().Int64Value();
+        slice.bytes_read = 0;
+        slice.buffer = nullptr;
+        req->batch_slices.push_back(slice);
+    }
+    Napi::Promise promise = req->deferred.Promise();
+
+    if (!EnsureCredentialsSafe(env)) {
+        req->deferred.Reject(CreateErrnoError(env, EPERM, "io_uring", filePath));
+        delete req;
+        return promise;
+    }
+
+    active_requests++;
+    stats.total_requests++;
+    RefEventLoopIfNeeded();
+    ScheduleStage(req);
+    return promise;
+}
+
+Napi::Value ReadvUring(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsString() || !info[1].IsArray()) {
+        Napi::TypeError::New(env, "Expected arguments: (path: string, buffers: Buffer[], position?: number)").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    std::string filePath = info[0].As<Napi::String>().Utf8Value();
+    Napi::Array bufs = info[1].As<Napi::Array>();
+    uint32_t count = bufs.Length();
+    if (count == 0) {
+        Napi::Promise::Deferred def = Napi::Promise::Deferred::New(env);
+        def.Resolve(Napi::Number::New(env, 0));
+        return def.Promise();
+    }
+
+    int64_t position = -1;
+    if (info.Length() >= 3 && info[2].IsNumber()) {
+        position = info[2].As<Napi::Number>().Int64Value();
+    }
+
+    IORequest* req = new IORequest(env, OP_READV, STAGE_OPEN, filePath);
+    req->open_flags = O_RDONLY;
+    req->file_offset = position >= 0 ? static_cast<uint64_t>(position) : 0;
+    req->iovecs.reserve(count);
+    req->iovec_refs.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        Napi::Value item = bufs.Get(i);
+        char* buf_ptr = nullptr;
+        size_t buf_len = 0;
+        if (item.IsBuffer()) {
+            Napi::Buffer<char> b = item.As<Napi::Buffer<char>>();
+            buf_ptr = b.Data();
+            buf_len = b.Length();
+        } else if (item.IsTypedArray()) {
+            Napi::TypedArray ta = item.As<Napi::TypedArray>();
+            buf_ptr = static_cast<char*>(ta.ArrayBuffer().Data()) + ta.ByteOffset();
+            buf_len = ta.ByteLength();
+        } else {
+            delete req;
+            Napi::TypeError::New(env, "All elements of buffers array must be Buffers or TypedArrays").ThrowAsJavaScriptException();
+            return env.Null();
+        }
+        struct iovec iov;
+        iov.iov_base = buf_ptr;
+        iov.iov_len = buf_len;
+        req->iovecs.push_back(iov);
+        req->iovec_refs.push_back(Napi::Reference<Napi::Object>::New(item.As<Napi::Object>(), 1));
+    }
+    Napi::Promise promise = req->deferred.Promise();
+
+    if (!EnsureCredentialsSafe(env)) {
+        req->deferred.Reject(CreateErrnoError(env, EPERM, "io_uring", filePath));
+        delete req;
+        return promise;
+    }
+
+    active_requests++;
+    stats.total_requests++;
+    RefEventLoopIfNeeded();
+    ScheduleStage(req);
+    return promise;
+}
+
+Napi::Value WritevUring(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsString() || !info[1].IsArray()) {
+        Napi::TypeError::New(env, "Expected arguments: (path: string, buffers: Buffer[], position?: number, openFlags?: number, mode?: number, flush?: boolean)").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    std::string filePath = info[0].As<Napi::String>().Utf8Value();
+    Napi::Array bufs = info[1].As<Napi::Array>();
+    uint32_t count = bufs.Length();
+    if (count == 0) {
+        Napi::Promise::Deferred def = Napi::Promise::Deferred::New(env);
+        def.Resolve(Napi::Number::New(env, 0));
+        return def.Promise();
+    }
+
+    int64_t position = -1;
+    if (info.Length() >= 3 && info[2].IsNumber()) {
+        position = info[2].As<Napi::Number>().Int64Value();
+    }
+    int openFlags = O_WRONLY | O_CREAT | O_TRUNC;
+    if (info.Length() >= 4 && info[3].IsNumber()) {
+        openFlags = info[3].As<Napi::Number>().Int32Value();
+    }
+    int mode = 0666;
+    if (info.Length() >= 5 && info[4].IsNumber()) {
+        mode = info[4].As<Napi::Number>().Int32Value();
+    }
+    bool flush = false;
+    if (info.Length() >= 6 && info[5].IsBoolean()) {
+        flush = info[5].As<Napi::Boolean>().Value();
+    }
+
+    IORequest* req = new IORequest(env, OP_WRITEV, STAGE_OPEN, filePath);
+    req->open_flags = openFlags;
+    req->mode = mode;
+    req->flush_after_write = flush;
+    if (openFlags & O_APPEND) {
+        req->file_offset = static_cast<uint64_t>(-1);
+    } else {
+        req->file_offset = position >= 0 ? static_cast<uint64_t>(position) : 0;
+    }
+
+    req->iovecs.reserve(count);
+    req->iovec_refs.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        Napi::Value item = bufs.Get(i);
+        if (!item.IsBuffer()) {
+            delete req;
+            Napi::TypeError::New(env, "All elements of buffers array must be Buffers").ThrowAsJavaScriptException();
+            return env.Null();
+        }
+        Napi::Buffer<char> b = item.As<Napi::Buffer<char>>();
+        struct iovec iov;
+        iov.iov_base = b.Data();
+        iov.iov_len = b.Length();
+        req->iovecs.push_back(iov);
+        req->iovec_refs.push_back(Napi::Reference<Napi::Object>::New(b, 1));
+    }
+    Napi::Promise promise = req->deferred.Promise();
+
+    if (!EnsureCredentialsSafe(env)) {
+        req->deferred.Reject(CreateErrnoError(env, EPERM, "io_uring", filePath));
+        delete req;
+        return promise;
+    }
+
+    active_requests++;
+    stats.total_requests++;
+    RefEventLoopIfNeeded();
+    ScheduleStage(req);
+    return promise;
+}
+
+Napi::Value FallocateUring(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 3 || !info[0].IsString() || !info[1].IsNumber() || !info[2].IsNumber()) {
+        Napi::TypeError::New(env, "Expected arguments: (path: string, offset: number, length: number, mode?: number)").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    std::string filePath = info[0].As<Napi::String>().Utf8Value();
+    int64_t offset = info[1].As<Napi::Number>().Int64Value();
+    int64_t length = info[2].As<Napi::Number>().Int64Value();
+    int mode = 0;
+    if (info.Length() >= 4 && info[3].IsNumber()) {
+        mode = info[3].As<Napi::Number>().Int32Value();
+    }
+
+    IORequest* req = new IORequest(env, OP_FALLOCATE, STAGE_OPEN, filePath);
+    req->open_flags = O_RDWR | O_CREAT;
+    req->mode = 0666;
+    req->file_offset = offset >= 0 ? static_cast<uint64_t>(offset) : 0;
+    req->size = length >= 0 ? static_cast<size_t>(length) : 0;
+    req->falloc_mode = mode;
+    Napi::Promise promise = req->deferred.Promise();
+
+    if (!EnsureCredentialsSafe(env)) {
+        req->deferred.Reject(CreateErrnoError(env, EPERM, "io_uring", filePath));
+        delete req;
+        return promise;
+    }
+
+    active_requests++;
+    stats.total_requests++;
+    RefEventLoopIfNeeded();
+    ScheduleStage(req);
+    return promise;
+}
+
+Napi::Value FadviseUring(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 4 || !info[0].IsString() || !info[1].IsNumber() || !info[2].IsNumber() || !info[3].IsNumber()) {
+        Napi::TypeError::New(env, "Expected arguments: (path: string, offset: number, length: number, advice: number)").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    std::string filePath = info[0].As<Napi::String>().Utf8Value();
+    int64_t offset = info[1].As<Napi::Number>().Int64Value();
+    int64_t length = info[2].As<Napi::Number>().Int64Value();
+    int advice = info[3].As<Napi::Number>().Int32Value();
+
+    IORequest* req = new IORequest(env, OP_FADVISE, STAGE_OPEN, filePath);
+    req->open_flags = O_RDONLY;
+    req->mode = 0666;
+    req->file_offset = offset >= 0 ? static_cast<uint64_t>(offset) : 0;
+    req->size = length >= 0 ? static_cast<size_t>(length) : 0;
+    req->fadvise_advice = advice;
+    Napi::Promise promise = req->deferred.Promise();
+
+    if (!EnsureCredentialsSafe(env)) {
+        req->deferred.Reject(CreateErrnoError(env, EPERM, "io_uring", filePath));
+        delete req;
+        return promise;
+    }
+
+    active_requests++;
+    stats.total_requests++;
+    RefEventLoopIfNeeded();
+    ScheduleStage(req);
+    return promise;
+}
+
+Napi::Value OpenHandleUring(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsString()) {
+        Napi::TypeError::New(env, "The 'path' argument must be a string").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    std::string filePath = info[0].As<Napi::String>().Utf8Value();
+    int openFlags = O_RDONLY;
+    if (info.Length() >= 2 && info[1].IsNumber()) {
+        openFlags = info[1].As<Napi::Number>().Int32Value();
+    }
+    int mode = 0666;
+    if (info.Length() >= 3 && info[2].IsNumber()) {
+        mode = info[2].As<Napi::Number>().Int32Value();
+    }
+
+    IORequest* req = new IORequest(env, OP_FH_OPEN, STAGE_OPEN, filePath);
+    req->open_flags = openFlags;
+    req->mode = mode;
+
+    if (direct_fds_supported && direct_fd_free_list.size() > 512) {
+        int slot = AllocateDirectSlot();
+        if (slot >= 0) {
+            req->direct_slot = slot;
+            req->stage = STAGE_OPEN_DIRECT;
+        }
+    }
+
+    Napi::Promise promise = req->deferred.Promise();
+
+    if (!EnsureCredentialsSafe(env)) {
+        req->deferred.Reject(CreateErrnoError(env, EPERM, "io_uring", filePath));
+        delete req;
+        return promise;
+    }
+
+    active_requests++;
+    stats.total_requests++;
+    RefEventLoopIfNeeded();
+    ScheduleStage(req);
+    return promise;
+}
+
+Napi::Value FhReadUring(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 5 || !info[0].IsNumber() || !info[1].IsNumber() || (!info[2].IsBuffer() && !info[2].IsTypedArray()) || !info[3].IsNumber() || !info[4].IsNumber()) {
+        Napi::TypeError::New(env, "Expected arguments: (fd: number, directSlot: number, buffer: Buffer | TypedArray, offset: number, length: number, position?: number)").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    int fd = info[0].As<Napi::Number>().Int32Value();
+    int directSlot = info[1].As<Napi::Number>().Int32Value();
+    char* targetData = nullptr;
+    size_t targetBufLen = 0;
+    if (info[2].IsBuffer()) {
+        Napi::Buffer<char> b = info[2].As<Napi::Buffer<char>>();
+        targetData = b.Data();
+        targetBufLen = b.Length();
+    } else {
+        Napi::TypedArray ta = info[2].As<Napi::TypedArray>();
+        targetData = static_cast<char*>(ta.ArrayBuffer().Data()) + ta.ByteOffset();
+        targetBufLen = ta.ByteLength();
+    }
+    int64_t rawOffset = info[3].As<Napi::Number>().Int64Value();
+    int64_t rawLen = info[4].As<Napi::Number>().Int64Value();
+
+    if (rawOffset < 0 || rawLen < 0 || static_cast<size_t>(rawOffset) > targetBufLen || static_cast<size_t>(rawLen) > targetBufLen - static_cast<size_t>(rawOffset)) {
+        Napi::RangeError::New(env, "offset + length is out of range for target buffer").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    size_t bufOffset = static_cast<size_t>(rawOffset);
+    size_t length = static_cast<size_t>(rawLen);
+    int64_t position = -1;
+    if (info.Length() >= 6 && info[5].IsNumber()) {
+        position = info[5].As<Napi::Number>().Int64Value();
+    }
+
+    IORequest* req = new IORequest(env, OP_FH_READ, STAGE_READ, "");
+    req->fd = fd;
+    req->direct_slot = directSlot;
+    req->owns_descriptor = false;
+    req->buffer = targetData + bufOffset;
+    req->buffer_capacity = length;
+    req->buffer_is_external = true;
+    req->size = length;
+    req->offset = 0;
+    req->file_offset = (position >= 0) ? static_cast<uint64_t>(position) : static_cast<uint64_t>(-1);
+    req->write_buf_ref.Reset(info[2].As<Napi::Object>(), 1);
+    Napi::Promise promise = req->deferred.Promise();
+
+    active_requests++;
+    stats.total_requests++;
+    RefEventLoopIfNeeded();
+    ScheduleStage(req);
+    return promise;
+}
+
+Napi::Value FhReadAtUring(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 4 || !info[0].IsNumber() || !info[1].IsNumber() || !info[2].IsNumber() || !info[3].IsNumber()) {
+        Napi::TypeError::New(env, "Expected arguments: (fd: number, directSlot: number, offset: number, length: number)").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    int fd = info[0].As<Napi::Number>().Int32Value();
+    int directSlot = info[1].As<Napi::Number>().Int32Value();
+    int64_t offset = info[2].As<Napi::Number>().Int64Value();
+    int64_t length = info[3].As<Napi::Number>().Int64Value();
+    if (length < 0) length = 0;
+
+    IORequest* req = new IORequest(env, OP_FH_READ_AT, STAGE_READ, "");
+    req->fd = fd;
+    req->direct_slot = directSlot;
+    req->owns_descriptor = false;
+    req->file_offset = offset >= 0 ? static_cast<uint64_t>(offset) : 0;
+    req->size = static_cast<size_t>(length);
+    req->offset = 0;
+
+    if (req->size <= default_optimistic_read_size && default_optimistic_read_size > 0) {
+        req->buffer = AcquireReadBuffer(default_optimistic_read_size);
+        req->buffer_capacity = req->buffer ? default_optimistic_read_size : 0;
+    } else {
+        size_t alloc_sz = req->size > 0 ? req->size : 1;
+        req->buffer = static_cast<char*>(std::malloc(alloc_sz));
+        req->buffer_capacity = req->buffer ? alloc_sz : 0;
+    }
+    if (!req->buffer) {
+        delete req;
+        Napi::Error::New(env, "Failed to allocate read buffer").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    Napi::Promise promise = req->deferred.Promise();
+
+    active_requests++;
+    stats.total_requests++;
+    RefEventLoopIfNeeded();
+    ScheduleStage(req);
+    return promise;
+}
+
+Napi::Value FhWriteUring(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 5 || !info[0].IsNumber() || !info[1].IsNumber() || (!info[2].IsBuffer() && !info[2].IsTypedArray()) || !info[3].IsNumber() || !info[4].IsNumber()) {
+        Napi::TypeError::New(env, "Expected arguments: (fd: number, directSlot: number, buffer: Buffer | TypedArray, offset: number, length: number, position?: number, openFlags?: number)").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    int fd = info[0].As<Napi::Number>().Int32Value();
+    int directSlot = info[1].As<Napi::Number>().Int32Value();
+    char* targetData = nullptr;
+    size_t targetBufLen = 0;
+    if (info[2].IsBuffer()) {
+        Napi::Buffer<char> b = info[2].As<Napi::Buffer<char>>();
+        targetData = b.Data();
+        targetBufLen = b.Length();
+    } else {
+        Napi::TypedArray ta = info[2].As<Napi::TypedArray>();
+        targetData = static_cast<char*>(ta.ArrayBuffer().Data()) + ta.ByteOffset();
+        targetBufLen = ta.ByteLength();
+    }
+    int64_t rawOffset = info[3].As<Napi::Number>().Int64Value();
+    int64_t rawLen = info[4].As<Napi::Number>().Int64Value();
+
+    if (rawOffset < 0 || rawLen < 0 || static_cast<size_t>(rawOffset) > targetBufLen || static_cast<size_t>(rawLen) > targetBufLen - static_cast<size_t>(rawOffset)) {
+        Napi::RangeError::New(env, "offset + length is out of range for data buffer").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    size_t bufOffset = static_cast<size_t>(rawOffset);
+    size_t length = static_cast<size_t>(rawLen);
+    int64_t position = -1;
+    if (info.Length() >= 6 && info[5].IsNumber()) {
+        position = info[5].As<Napi::Number>().Int64Value();
+    }
+    int openFlags = 0;
+    if (info.Length() >= 7 && info[6].IsNumber()) {
+        openFlags = info[6].As<Napi::Number>().Int32Value();
+    }
+
+    IORequest* req = new IORequest(env, OP_FH_WRITE, STAGE_WRITE, "");
+    req->fd = fd;
+    req->direct_slot = directSlot;
+    req->owns_descriptor = false;
+    req->write_ptr = targetData + bufOffset;
+    req->size = length;
+    req->offset = 0;
+    req->open_flags = openFlags;
+    req->file_offset = (position >= 0) ? static_cast<uint64_t>(position) : static_cast<uint64_t>(-1);
+    req->write_buf_ref.Reset(info[2].As<Napi::Object>(), 1);
+    Napi::Promise promise = req->deferred.Promise();
+
+    active_requests++;
+    stats.total_requests++;
+    RefEventLoopIfNeeded();
+    ScheduleStage(req);
+    return promise;
+}
+
+Napi::Value FhReadvUring(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 3 || !info[0].IsNumber() || !info[1].IsNumber() || !info[2].IsArray()) {
+        Napi::TypeError::New(env, "Expected arguments: (fd: number, directSlot: number, buffers: Buffer[], position?: number)").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    int fd = info[0].As<Napi::Number>().Int32Value();
+    int directSlot = info[1].As<Napi::Number>().Int32Value();
+    Napi::Array bufs = info[2].As<Napi::Array>();
+    uint32_t count = bufs.Length();
+    if (count == 0) {
+        Napi::Promise::Deferred def = Napi::Promise::Deferred::New(env);
+        def.Resolve(Napi::Number::New(env, 0));
+        return def.Promise();
+    }
+
+    int64_t position = -1;
+    if (info.Length() >= 4 && info[3].IsNumber()) {
+        position = info[3].As<Napi::Number>().Int64Value();
+    }
+
+    IORequest* req = new IORequest(env, OP_FH_READV, STAGE_READV, "");
+    req->fd = fd;
+    req->direct_slot = directSlot;
+    req->owns_descriptor = false;
+    req->file_offset = (position >= 0) ? static_cast<uint64_t>(position) : static_cast<uint64_t>(-1);
+    req->iovecs.reserve(count);
+    req->iovec_refs.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        Napi::Value item = bufs.Get(i);
+        if (!item.IsBuffer()) {
+            delete req;
+            Napi::TypeError::New(env, "All elements of buffers array must be Buffers").ThrowAsJavaScriptException();
+            return env.Null();
+        }
+        Napi::Buffer<char> b = item.As<Napi::Buffer<char>>();
+        struct iovec iov;
+        iov.iov_base = b.Data();
+        iov.iov_len = b.Length();
+        req->iovecs.push_back(iov);
+        req->iovec_refs.push_back(Napi::Reference<Napi::Object>::New(b, 1));
+    }
+    Napi::Promise promise = req->deferred.Promise();
+
+    active_requests++;
+    stats.total_requests++;
+    RefEventLoopIfNeeded();
+    ScheduleStage(req);
+    return promise;
+}
+
+Napi::Value FhWritevUring(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 3 || !info[0].IsNumber() || !info[1].IsNumber() || !info[2].IsArray()) {
+        Napi::TypeError::New(env, "Expected arguments: (fd: number, directSlot: number, buffers: Buffer[], position?: number, openFlags?: number)").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    int fd = info[0].As<Napi::Number>().Int32Value();
+    int directSlot = info[1].As<Napi::Number>().Int32Value();
+    Napi::Array bufs = info[2].As<Napi::Array>();
+    uint32_t count = bufs.Length();
+    if (count == 0) {
+        Napi::Promise::Deferred def = Napi::Promise::Deferred::New(env);
+        def.Resolve(Napi::Number::New(env, 0));
+        return def.Promise();
+    }
+
+    int64_t position = -1;
+    if (info.Length() >= 4 && info[3].IsNumber()) {
+        position = info[3].As<Napi::Number>().Int64Value();
+    }
+    int openFlags = 0;
+    if (info.Length() >= 5 && info[4].IsNumber()) {
+        openFlags = info[4].As<Napi::Number>().Int32Value();
+    }
+
+    IORequest* req = new IORequest(env, OP_FH_WRITEV, STAGE_WRITEV, "");
+    req->fd = fd;
+    req->direct_slot = directSlot;
+    req->owns_descriptor = false;
+    req->open_flags = openFlags;
+    req->file_offset = (position >= 0) ? static_cast<uint64_t>(position) : static_cast<uint64_t>(-1);
+    req->iovecs.reserve(count);
+    req->iovec_refs.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        Napi::Value item = bufs.Get(i);
+        if (!item.IsBuffer()) {
+            delete req;
+            Napi::TypeError::New(env, "All elements of buffers array must be Buffers").ThrowAsJavaScriptException();
+            return env.Null();
+        }
+        Napi::Buffer<char> b = item.As<Napi::Buffer<char>>();
+        struct iovec iov;
+        iov.iov_base = b.Data();
+        iov.iov_len = b.Length();
+        req->iovecs.push_back(iov);
+        req->iovec_refs.push_back(Napi::Reference<Napi::Object>::New(b, 1));
+    }
+    Napi::Promise promise = req->deferred.Promise();
+
+    active_requests++;
+    stats.total_requests++;
+    RefEventLoopIfNeeded();
+    ScheduleStage(req);
+    return promise;
+}
+
+Napi::Value FhSyncUring(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
+        Napi::TypeError::New(env, "Expected arguments: (fd: number, directSlot: number, datasyncOnly?: boolean)").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    int fd = info[0].As<Napi::Number>().Int32Value();
+    int directSlot = info[1].As<Napi::Number>().Int32Value();
+    bool datasyncOnly = (info.Length() >= 3 && info[2].IsBoolean() && info[2].As<Napi::Boolean>().Value());
+
+    IORequest* req = new IORequest(env, OP_FH_FSYNC, STAGE_FSYNC, "");
+    req->fd = fd;
+    req->direct_slot = directSlot;
+    req->owns_descriptor = false;
+    req->fsync_flags = datasyncOnly ? IORING_FSYNC_DATASYNC : 0;
+    Napi::Promise promise = req->deferred.Promise();
+
+    active_requests++;
+    stats.total_requests++;
+    RefEventLoopIfNeeded();
+    ScheduleStage(req);
+    return promise;
+}
+
+Napi::Value FhFallocateUring(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 5 || !info[0].IsNumber() || !info[1].IsNumber() || !info[2].IsNumber() || !info[3].IsNumber() || !info[4].IsNumber()) {
+        Napi::TypeError::New(env, "Expected arguments: (fd: number, directSlot: number, mode: number, offset: number, length: number)").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    int fd = info[0].As<Napi::Number>().Int32Value();
+    int directSlot = info[1].As<Napi::Number>().Int32Value();
+    int mode = info[2].As<Napi::Number>().Int32Value();
+    int64_t offset = info[3].As<Napi::Number>().Int64Value();
+    int64_t length = info[4].As<Napi::Number>().Int64Value();
+
+    IORequest* req = new IORequest(env, OP_FH_FALLOCATE, STAGE_FALLOCATE, "");
+    req->fd = fd;
+    req->direct_slot = directSlot;
+    req->owns_descriptor = false;
+    req->falloc_mode = mode;
+    req->file_offset = offset >= 0 ? static_cast<uint64_t>(offset) : 0;
+    req->size = length >= 0 ? static_cast<size_t>(length) : 0;
+    Napi::Promise promise = req->deferred.Promise();
+
+    active_requests++;
+    stats.total_requests++;
+    RefEventLoopIfNeeded();
+    ScheduleStage(req);
+    return promise;
+}
+
+Napi::Value FhFadviseUring(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 5 || !info[0].IsNumber() || !info[1].IsNumber() || !info[2].IsNumber() || !info[3].IsNumber() || !info[4].IsNumber()) {
+        Napi::TypeError::New(env, "Expected arguments: (fd: number, directSlot: number, offset: number, length: number, advice: number)").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    int fd = info[0].As<Napi::Number>().Int32Value();
+    int directSlot = info[1].As<Napi::Number>().Int32Value();
+    int64_t offset = info[2].As<Napi::Number>().Int64Value();
+    int64_t length = info[3].As<Napi::Number>().Int64Value();
+    int advice = info[4].As<Napi::Number>().Int32Value();
+
+    IORequest* req = new IORequest(env, OP_FH_FADVISE, STAGE_FADVISE, "");
+    req->fd = fd;
+    req->direct_slot = directSlot;
+    req->owns_descriptor = false;
+    req->file_offset = offset >= 0 ? static_cast<uint64_t>(offset) : 0;
+    req->size = length >= 0 ? static_cast<size_t>(length) : 0;
+    req->fadvise_advice = advice;
+    Napi::Promise promise = req->deferred.Promise();
+
+    active_requests++;
+    stats.total_requests++;
+    RefEventLoopIfNeeded();
+    ScheduleStage(req);
+    return promise;
+}
+
+Napi::Value FhCloseUring(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
+        Napi::TypeError::New(env, "Expected arguments: (fd: number, directSlot: number)").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    int fd = info[0].As<Napi::Number>().Int32Value();
+    int directSlot = info[1].As<Napi::Number>().Int32Value();
+
+    RequestStage stage = (directSlot >= 0) ? STAGE_CLOSE_DIRECT : STAGE_CLOSE;
+    IORequest* req = new IORequest(env, OP_FH_CLOSE, stage, "");
+    req->fd = fd;
+    req->direct_slot = directSlot;
+    req->owns_descriptor = true;
+    Napi::Promise promise = req->deferred.Promise();
+
+    active_requests++;
+    stats.total_requests++;
+    RefEventLoopIfNeeded();
+    ScheduleStage(req);
+    return promise;
+}
+
 Napi::Value IsSupported(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(info.Env(), ring_supported);
 }
@@ -2733,6 +4273,7 @@ static void CleanupModule(void* arg) {
     unadvanced_cqes = 0;
     ClearOptimisticBufferPool();
     direct_fd_free_list.clear();
+    for (int i = 0; i < DIRECT_FD_TABLE_SIZE; ++i) direct_slot_allocated[i] = false;
     direct_fds_supported = false;
     if (ring_supported) {
         io_uring_queue_exit(&ring);
@@ -2800,6 +4341,27 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("symlink", Napi::Function::New(env, SymlinkUring));
     exports.Set("link", Napi::Function::New(env, LinkUring));
     exports.Set("fsync", Napi::Function::New(env, FsyncUring));
+    exports.Set("readBatchAt", Napi::Function::New(env, ReadBatchAtUring));
+    exports.Set("readv", Napi::Function::New(env, ReadvUring));
+    exports.Set("writev", Napi::Function::New(env, WritevUring));
+    exports.Set("fallocate", Napi::Function::New(env, FallocateUring));
+    exports.Set("fadvise", Napi::Function::New(env, FadviseUring));
+    exports.Set("openHandle", Napi::Function::New(env, OpenHandleUring));
+    exports.Set("fhRead", Napi::Function::New(env, FhReadUring));
+    exports.Set("fhReadAt", Napi::Function::New(env, FhReadAtUring));
+    exports.Set("fhWrite", Napi::Function::New(env, FhWriteUring));
+    exports.Set("fhReadv", Napi::Function::New(env, FhReadvUring));
+    exports.Set("fhWritev", Napi::Function::New(env, FhWritevUring));
+    exports.Set("fhSync", Napi::Function::New(env, FhSyncUring));
+    exports.Set("fhFallocate", Napi::Function::New(env, FhFallocateUring));
+    exports.Set("fhFadvise", Napi::Function::New(env, FhFadviseUring));
+    exports.Set("fhClose", Napi::Function::New(env, FhCloseUring));
+    exports.Set("POSIX_FADV_NORMAL", Napi::Number::New(env, POSIX_FADV_NORMAL));
+    exports.Set("POSIX_FADV_RANDOM", Napi::Number::New(env, POSIX_FADV_RANDOM));
+    exports.Set("POSIX_FADV_SEQUENTIAL", Napi::Number::New(env, POSIX_FADV_SEQUENTIAL));
+    exports.Set("POSIX_FADV_WILLNEED", Napi::Number::New(env, POSIX_FADV_WILLNEED));
+    exports.Set("POSIX_FADV_DONTNEED", Napi::Number::New(env, POSIX_FADV_DONTNEED));
+    exports.Set("POSIX_FADV_NOREUSE", Napi::Number::New(env, POSIX_FADV_NOREUSE));
     exports.Set("isSupported", Napi::Function::New(env, IsSupported));
     exports.Set("getUnsupportedReason", Napi::Function::New(env, GetUnsupportedReason));
     exports.Set("getRingStats", Napi::Function::New(env, GetRingStats));
