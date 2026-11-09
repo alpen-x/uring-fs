@@ -2,6 +2,7 @@ import cjsModule from './index.js';
 
 export const {
   readFile,
+  readAt,
   writeFile,
   appendFile,
   copyFile,
@@ -10,6 +11,7 @@ export const {
   access,
   exists,
   unlink,
+  rmdir,
   mkdir,
   rename,
   symlink,

@@ -463,6 +463,81 @@ async function readFile(filePath, options) {
 }
 
 /**
+ * Reads a specific portion of a file asynchronously at the specified offset.
+ *
+ * @param {string | Buffer | URL} filePath Path to the file.
+ * @param {number} offset The position in the file to start reading from.
+ * @param {number} length The number of bytes to read.
+ * @param {string | { encoding?: BufferEncoding | null, signal?: AbortSignal, fallback?: 'fs' | 'worker' | boolean | object, strict?: boolean } | null} [options]
+ * @returns {Promise<Buffer | string>}
+ */
+async function readAt(filePath, offset, length, options) {
+  if (typeof offset !== 'number' || !Number.isFinite(offset) || !Number.isInteger(offset) || offset < 0) {
+    const err = new RangeError(`The "offset" argument must be a non-negative integer. Received ${offset}`);
+    err.code = 'ERR_OUT_OF_RANGE';
+    throw err;
+  }
+  if (typeof length !== 'number' || !Number.isFinite(length) || !Number.isInteger(length) || length < 0) {
+    const err = new RangeError(`The "length" argument must be a non-negative integer. Received ${length}`);
+    err.code = 'ERR_OUT_OF_RANGE';
+    throw err;
+  }
+
+  let encoding = null;
+  let signal = undefined;
+
+  if (typeof options === 'string') {
+    encoding = options;
+  } else if (options && typeof options === 'object') {
+    encoding = options.encoding ?? null;
+    signal = options.signal;
+  }
+
+  validateEncoding(encoding);
+
+  if (signal && signal.aborted) {
+    throw createAbortError(signal);
+  }
+
+  const normalized = normalizePath(filePath);
+
+  if (length === 0) {
+    return encoding ? '' : Buffer.alloc(0);
+  }
+
+  const backend = selectExecutionBackend(typeof options === 'object' ? options : undefined);
+
+  if (backend.type === 'provider') {
+    if (typeof backend.provider.open === 'function') {
+      const fh = await wrapWithAbortSignal(backend.provider.open(normalized, 'r'), signal);
+      try {
+        const buf = Buffer.allocUnsafe(length);
+        const { bytesRead } = await wrapWithAbortSignal(fh.read(buf, 0, length, offset), signal);
+        const resultBuf = bytesRead < length ? buf.subarray(0, bytesRead) : buf;
+        return encoding ? resultBuf.toString(encoding) : resultBuf;
+      } finally {
+        await fh.close();
+      }
+    }
+    const fullBuf = await wrapWithAbortSignal(backend.provider.readFile(normalized), signal);
+    const start = Math.min(offset, fullBuf.length);
+    const end = Math.min(offset + length, fullBuf.length);
+    const slice = fullBuf.subarray(start, end);
+    return encoding ? slice.toString(encoding) : slice;
+  }
+
+  if (backend.type === 'worker') {
+    const workerPromise = getWorkerPool().exec('readAt', [normalized, offset, length]);
+    const buffer = await wrapWithAbortSignal(workerPromise, signal);
+    return encoding ? buffer.toString(encoding) : buffer;
+  }
+
+  const rawPromise = native.readAt(normalized, offset, length);
+  const buffer = await wrapWithAbortSignal(rawPromise, signal);
+  return encoding ? buffer.toString(encoding) : buffer;
+}
+
+/**
  * Writes data to a file asynchronously via io_uring.
  */
 async function writeFile(filePath, data, options) {
@@ -532,10 +607,18 @@ async function appendFile(filePath, data, options) {
  */
 async function copyFile(srcPath, destPath, options) {
   let mode = 0;
+  let signal = undefined;
   if (typeof options === 'number') {
     mode = options;
-  } else if (options && typeof options === 'object' && typeof options.mode === 'number') {
-    mode = options.mode;
+  } else if (options && typeof options === 'object') {
+    if (typeof options.mode === 'number') {
+      mode = options.mode;
+    }
+    signal = options.signal;
+  }
+
+  if (signal && signal.aborted) {
+    throw createAbortError(signal);
   }
 
   const srcNormalized = normalizePath(srcPath);
@@ -544,38 +627,43 @@ async function copyFile(srcPath, destPath, options) {
 
   if (backend.type === 'provider') {
     if (typeof backend.provider.copyFile === 'function') {
-      return backend.provider.copyFile(srcNormalized, destNormalized, mode);
+      return wrapWithAbortSignal(backend.provider.copyFile(srcNormalized, destNormalized, mode), signal);
     }
-    const content = await backend.provider.readFile(srcNormalized);
+    const content = await wrapWithAbortSignal(backend.provider.readFile(srcNormalized), signal);
     const flag = (mode & fsConstants.COPYFILE_EXCL) ? 'wx' : 'w';
-    return backend.provider.writeFile(destNormalized, content, { flag });
+    return wrapWithAbortSignal(backend.provider.writeFile(destNormalized, content, { flag }), signal);
   }
 
   if (backend.type === 'worker') {
-    return getWorkerPool().exec('copyFile', [srcNormalized, destNormalized, mode]);
+    return wrapWithAbortSignal(getWorkerPool().exec('copyFile', [srcNormalized, destNormalized, mode]), signal);
   }
 
   const copyFlags = (mode & fsConstants.COPYFILE_EXCL) ? 1 : 0;
-  await native.copyFile(srcNormalized, destNormalized, copyFlags);
+  await wrapWithAbortSignal(native.copyFile(srcNormalized, destNormalized, copyFlags), signal);
 }
 
 /**
  * Retrieves file or directory metadata via io_uring statx (following symlinks).
  */
 async function stat(filePath, options) {
+  const signal = options && typeof options === 'object' ? options.signal : undefined;
+  if (signal && signal.aborted) {
+    throw createAbortError(signal);
+  }
+
   const normalized = normalizePath(filePath);
   const backend = selectExecutionBackend(options);
 
   if (backend.type === 'provider') {
-    return backend.provider.stat(normalized);
+    return wrapWithAbortSignal(backend.provider.stat(normalized), signal);
   }
 
   if (backend.type === 'worker') {
-    const raw = await getWorkerPool().exec('stat', [normalized]);
+    const raw = await wrapWithAbortSignal(getWorkerPool().exec('stat', [normalized]), signal);
     return new UringStats(raw);
   }
 
-  const raw = await native.stat(normalized);
+  const raw = await wrapWithAbortSignal(native.stat(normalized), signal);
   return new UringStats(raw);
 }
 
@@ -583,22 +671,27 @@ async function stat(filePath, options) {
  * Retrieves file, directory, or symbolic link metadata via io_uring statx (AT_SYMLINK_NOFOLLOW).
  */
 async function lstat(filePath, options) {
+  const signal = options && typeof options === 'object' ? options.signal : undefined;
+  if (signal && signal.aborted) {
+    throw createAbortError(signal);
+  }
+
   const normalized = normalizePath(filePath);
   const backend = selectExecutionBackend(options);
 
   if (backend.type === 'provider') {
     if (typeof backend.provider.lstat === 'function') {
-      return backend.provider.lstat(normalized);
+      return wrapWithAbortSignal(backend.provider.lstat(normalized), signal);
     }
-    return backend.provider.stat(normalized);
+    return wrapWithAbortSignal(backend.provider.stat(normalized), signal);
   }
 
   if (backend.type === 'worker') {
-    const raw = await getWorkerPool().exec('lstat', [normalized]);
+    const raw = await wrapWithAbortSignal(getWorkerPool().exec('lstat', [normalized]), signal);
     return new UringStats(raw);
   }
 
-  const raw = await native.lstat(normalized);
+  const raw = await wrapWithAbortSignal(native.lstat(normalized), signal);
   return new UringStats(raw);
 }
 
@@ -675,19 +768,48 @@ async function exists(filePath, options) {
  * Removes a file or symbolic link asynchronously via io_uring unlinkat.
  */
 async function unlink(filePath, options) {
+  const signal = options && typeof options === 'object' ? options.signal : undefined;
+  if (signal && signal.aborted) {
+    throw createAbortError(signal);
+  }
+
   const normalized = normalizePath(filePath);
   const backend = selectExecutionBackend(options);
 
   if (backend.type === 'provider') {
-    return backend.provider.unlink(normalized);
+    return wrapWithAbortSignal(backend.provider.unlink(normalized), signal);
   }
 
   if (backend.type === 'worker') {
-    await getWorkerPool().exec('unlink', [normalized]);
+    await wrapWithAbortSignal(getWorkerPool().exec('unlink', [normalized]), signal);
     return;
   }
 
-  await native.unlink(normalized);
+  await wrapWithAbortSignal(native.unlink(normalized), signal);
+}
+
+/**
+ * Removes a directory asynchronously via 1-SQE io_uring unlinkat (AT_REMOVEDIR).
+ */
+async function rmdir(dirPath, options) {
+  const signal = options && typeof options === 'object' ? options.signal : undefined;
+  if (signal && signal.aborted) {
+    throw createAbortError(signal);
+  }
+
+  const normalized = normalizePath(dirPath);
+  const backend = selectExecutionBackend(options);
+
+  if (backend.type === 'provider') {
+    return wrapWithAbortSignal(backend.provider.rmdir(normalized, options), signal);
+  }
+
+  if (backend.type === 'worker') {
+    await wrapWithAbortSignal(getWorkerPool().exec('rmdir', [normalized, options]), signal);
+    return;
+  }
+
+  await wrapWithAbortSignal(native.rmdir(normalized), signal);
 }
 
 /**
@@ -696,33 +818,39 @@ async function unlink(filePath, options) {
 async function mkdir(dirPath, options) {
   let mode = 0o777;
   let recursive = false;
+  let signal = undefined;
 
   if (typeof options === 'number') {
     mode = options;
   } else if (options && typeof options === 'object') {
     if (options.mode !== undefined) mode = options.mode;
     if (options.recursive !== undefined) recursive = Boolean(options.recursive);
+    signal = options.signal;
+  }
+
+  if (signal && signal.aborted) {
+    throw createAbortError(signal);
   }
 
   const normalized = normalizePath(dirPath);
   const backend = selectExecutionBackend(typeof options === 'object' ? options : undefined);
 
   if (backend.type === 'provider') {
-    return backend.provider.mkdir(normalized, { recursive, mode });
+    return wrapWithAbortSignal(backend.provider.mkdir(normalized, { recursive, mode }), signal);
   }
 
   if (backend.type === 'worker') {
-    return getWorkerPool().exec('mkdir', [normalized, { recursive, mode }]);
+    return wrapWithAbortSignal(getWorkerPool().exec('mkdir', [normalized, { recursive, mode }]), signal);
   }
 
   if (!recursive) {
-    await native.mkdir(normalized, mode);
+    await wrapWithAbortSignal(native.mkdir(normalized, mode), signal);
     return undefined;
   }
 
   const resolved = pathModule.resolve(normalized);
   try {
-    await native.mkdir(resolved, mode);
+    await wrapWithAbortSignal(native.mkdir(resolved, mode), signal);
     return resolved;
   } catch (err) {
     if (err.code === 'EEXIST') {
@@ -735,7 +863,7 @@ async function mkdir(dirPath, options) {
       if (parent !== resolved) {
         const firstCreated = await mkdir(parent, { ...(typeof options === 'object' ? options : {}), recursive: true, mode });
         try {
-          await native.mkdir(resolved, mode);
+          await wrapWithAbortSignal(native.mkdir(resolved, mode), signal);
           return firstCreated ?? resolved;
         } catch (e2) {
           if (e2.code === 'EEXIST') {
@@ -754,20 +882,25 @@ async function mkdir(dirPath, options) {
  * Atomically renames or moves a file or directory via io_uring renameat.
  */
 async function rename(oldPath, newPath, options) {
+  const signal = options && typeof options === 'object' ? options.signal : undefined;
+  if (signal && signal.aborted) {
+    throw createAbortError(signal);
+  }
+
   const oldNormalized = normalizePath(oldPath);
   const newNormalized = normalizePath(newPath);
   const backend = selectExecutionBackend(options);
 
   if (backend.type === 'provider') {
-    return backend.provider.rename(oldNormalized, newNormalized);
+    return wrapWithAbortSignal(backend.provider.rename(oldNormalized, newNormalized), signal);
   }
 
   if (backend.type === 'worker') {
-    await getWorkerPool().exec('rename', [oldNormalized, newNormalized]);
+    await wrapWithAbortSignal(getWorkerPool().exec('rename', [oldNormalized, newNormalized]), signal);
     return;
   }
 
-  await native.rename(oldNormalized, newNormalized);
+  await wrapWithAbortSignal(native.rename(oldNormalized, newNormalized), signal);
 }
 
 /**
@@ -776,57 +909,71 @@ async function rename(oldPath, newPath, options) {
 async function symlink(target, linkPath, typeOrOptions) {
   const type = typeof typeOrOptions === 'string' ? typeOrOptions : undefined;
   const options = typeof typeOrOptions === 'object' && typeOrOptions !== null ? typeOrOptions : undefined;
+  const signal = options ? options.signal : undefined;
+  if (signal && signal.aborted) {
+    throw createAbortError(signal);
+  }
 
   const targetNormalized = normalizePath(target);
   const linkNormalized = normalizePath(linkPath);
   const backend = selectExecutionBackend(options);
 
   if (backend.type === 'provider') {
-    return backend.provider.symlink(targetNormalized, linkNormalized, type);
+    return wrapWithAbortSignal(backend.provider.symlink(targetNormalized, linkNormalized, type), signal);
   }
 
   if (backend.type === 'worker') {
-    await getWorkerPool().exec('symlink', [targetNormalized, linkNormalized, type]);
+    await wrapWithAbortSignal(getWorkerPool().exec('symlink', [targetNormalized, linkNormalized, type]), signal);
     return;
   }
 
-  await native.symlink(targetNormalized, linkNormalized);
+  await wrapWithAbortSignal(native.symlink(targetNormalized, linkNormalized), signal);
 }
 
 /**
  * Creates a hard link asynchronously via io_uring linkat.
  */
 async function link(existingPath, newPath, options) {
+  const signal = options && typeof options === 'object' ? options.signal : undefined;
+  if (signal && signal.aborted) {
+    throw createAbortError(signal);
+  }
+
   const existingNormalized = normalizePath(existingPath);
   const newNormalized = normalizePath(newPath);
   const backend = selectExecutionBackend(options);
 
   if (backend.type === 'provider') {
-    return backend.provider.link(existingNormalized, newNormalized);
+    return wrapWithAbortSignal(backend.provider.link(existingNormalized, newNormalized), signal);
   }
 
   if (backend.type === 'worker') {
-    await getWorkerPool().exec('link', [existingNormalized, newNormalized]);
+    await wrapWithAbortSignal(getWorkerPool().exec('link', [existingNormalized, newNormalized]), signal);
     return;
   }
 
-  await native.link(existingNormalized, newNormalized);
+  await wrapWithAbortSignal(native.link(existingNormalized, newNormalized), signal);
 }
 
 /**
  * Flushes all modified in-core data and metadata of a file to the storage device via io_uring fsync.
  */
 async function fsync(filePath, options) {
+  const signal = options && typeof options === 'object' ? options.signal : undefined;
+  if (signal && signal.aborted) {
+    throw createAbortError(signal);
+  }
+
   const normalized = normalizePath(filePath);
   const backend = selectExecutionBackend(options);
 
   if (backend.type === 'provider') {
     if (typeof backend.provider.fsync === 'function') {
-      return backend.provider.fsync(normalized);
+      return wrapWithAbortSignal(backend.provider.fsync(normalized), signal);
     }
-    const fh = await fsPromises.open(normalized, 'r');
+    const fh = await wrapWithAbortSignal(fsPromises.open(normalized, 'r'), signal);
     try {
-      await fh.sync();
+      await wrapWithAbortSignal(fh.sync(), signal);
     } finally {
       await fh.close();
     }
@@ -834,27 +981,32 @@ async function fsync(filePath, options) {
   }
 
   if (backend.type === 'worker') {
-    await getWorkerPool().exec('fsync', [normalized, false]);
+    await wrapWithAbortSignal(getWorkerPool().exec('fsync', [normalized, false]), signal);
     return;
   }
 
-  await native.fsync(normalized, false);
+  await wrapWithAbortSignal(native.fsync(normalized, false), signal);
 }
 
 /**
  * Flushes all modified in-core file data (excluding non-essential metadata) via io_uring fdatasync.
  */
 async function fdatasync(filePath, options) {
+  const signal = options && typeof options === 'object' ? options.signal : undefined;
+  if (signal && signal.aborted) {
+    throw createAbortError(signal);
+  }
+
   const normalized = normalizePath(filePath);
   const backend = selectExecutionBackend(options);
 
   if (backend.type === 'provider') {
     if (typeof backend.provider.fdatasync === 'function') {
-      return backend.provider.fdatasync(normalized);
+      return wrapWithAbortSignal(backend.provider.fdatasync(normalized), signal);
     }
-    const fh = await fsPromises.open(normalized, 'r');
+    const fh = await wrapWithAbortSignal(fsPromises.open(normalized, 'r'), signal);
     try {
-      await fh.datasync();
+      await wrapWithAbortSignal(fh.datasync(), signal);
     } finally {
       await fh.close();
     }
@@ -862,15 +1014,16 @@ async function fdatasync(filePath, options) {
   }
 
   if (backend.type === 'worker') {
-    await getWorkerPool().exec('fsync', [normalized, true]);
+    await wrapWithAbortSignal(getWorkerPool().exec('fsync', [normalized, true]), signal);
     return;
   }
 
-  await native.fsync(normalized, true);
+  await wrapWithAbortSignal(native.fsync(normalized, true), signal);
 }
 
 module.exports = {
   readFile,
+  readAt,
   writeFile,
   appendFile,
   copyFile,
@@ -879,6 +1032,7 @@ module.exports = {
   access,
   exists,
   unlink,
+  rmdir,
   mkdir,
   rename,
   symlink,

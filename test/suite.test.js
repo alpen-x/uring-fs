@@ -648,4 +648,205 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
 
     assert.equal(seenSeqs.size, totalRecords, 'All 200 unique records (0..199) must be present without duplicates or drops');
   });
+
+  test('18. Positional readAt (3-SQE chain), 1-SQE rmdir, and uniform AbortSignal across all APIs', async () => {
+    // 1. readAt positional reads and slice accuracy
+    const posFile = path.join(tmpDir, 'read_at_pos.bin');
+    const fullText = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    await uringFs.writeFile(posFile, fullText);
+
+    // Read middle chunk as Buffer
+    const statsBeforePos = uringFs.getRingStats();
+    const slice0 = await uringFs.readAt(posFile, 0, 10);
+    const statsAfterPos = uringFs.getRingStats();
+    assert.equal(slice0.toString('utf8'), '0123456789');
+    if (uringFs.isUringSupported()) {
+      assert.equal(
+        statsAfterPos.totalSqesPrepared - statsBeforePos.totalSqesPrepared,
+        3,
+        'readAt must execute in exactly 3 SQEs: OPENAT_DIRECT -> READ -> CLOSE_DIRECT'
+      );
+    }
+
+    // Read with string encoding option
+    const sliceStr = await uringFs.readAt(posFile, 10, 5, 'utf8');
+    assert.equal(sliceStr, 'ABCDE');
+
+    const sliceObjEnc = await uringFs.readAt(posFile, 10, 5, { encoding: 'utf8' });
+    assert.equal(sliceObjEnc, 'ABCDE');
+
+    // Read extending past EOF (offset 20 to past end)
+    const slicePastEof = await uringFs.readAt(posFile, 20, 100, 'utf8');
+    assert.equal(slicePastEof, 'KLMNOPQRSTUVWXYZ');
+
+    // Read completely beyond EOF
+    const beyondEof = await uringFs.readAt(posFile, 100, 10);
+    assert.equal(beyondEof.length, 0);
+
+    // Read with length 0
+    const zeroLenBuf = await uringFs.readAt(posFile, 5, 0);
+    assert.equal(zeroLenBuf.length, 0);
+    const zeroLenStr = await uringFs.readAt(posFile, 5, 0, 'utf8');
+    assert.equal(zeroLenStr, '');
+
+    // Argument bounds validation
+    await assert.rejects(
+      async () => {
+        await uringFs.readAt(posFile, -1, 10);
+      },
+      { name: 'RangeError', code: 'ERR_OUT_OF_RANGE' }
+    );
+    await assert.rejects(
+      async () => {
+        await uringFs.readAt(posFile, 0, -5);
+      },
+      { name: 'RangeError', code: 'ERR_OUT_OF_RANGE' }
+    );
+
+    // readAt fallback backends
+    const workerSlice = await uringFs.readAt(posFile, 10, 5, { fallback: 'worker', encoding: 'utf8' });
+    assert.equal(workerSlice, 'ABCDE');
+    const fsSlice = await uringFs.readAt(posFile, 10, 5, { fallback: 'fs', encoding: 'utf8' });
+    assert.equal(fsSlice, 'ABCDE');
+    await uringFs.closeFallbackWorkers();
+
+    // 2. rmdir directory removal
+    const emptySubdir = path.join(tmpDir, 'empty_dir_to_remove');
+    await uringFs.mkdir(emptySubdir);
+    assert.equal(await uringFs.exists(emptySubdir), true);
+
+    const statsBeforeRmdir = uringFs.getRingStats();
+    await uringFs.rmdir(emptySubdir);
+    const statsAfterRmdir = uringFs.getRingStats();
+    if (uringFs.isUringSupported()) {
+      assert.equal(
+        statsAfterRmdir.totalSqesPrepared - statsBeforeRmdir.totalSqesPrepared,
+        1,
+        'rmdir must execute in exactly 1 SQE via io_uring_prep_unlinkat with AT_REMOVEDIR'
+      );
+    }
+    assert.equal(await uringFs.exists(emptySubdir), false);
+
+    // Attempt rmdir on non-empty directory
+    const nonEmptyDir = path.join(tmpDir, 'non_empty_dir');
+    await uringFs.mkdir(nonEmptyDir);
+    const insideFile = path.join(nonEmptyDir, 'inside.txt');
+    await uringFs.writeFile(insideFile, 'hello');
+    await assert.rejects(
+      async () => {
+        await uringFs.rmdir(nonEmptyDir);
+      },
+      (err) => err.code === 'ENOTEMPTY' || err.code === 'EEXIST'
+    );
+    await uringFs.unlink(insideFile);
+    await uringFs.rmdir(nonEmptyDir);
+    assert.equal(await uringFs.exists(nonEmptyDir), false);
+
+    // Attempt rmdir on non-existent directory
+    await assert.rejects(
+      async () => {
+        await uringFs.rmdir(path.join(tmpDir, 'does_not_exist_dir'));
+      },
+      { code: 'ENOENT' }
+    );
+
+    // rmdir fallbacks
+    const workerEmptyDir = path.join(tmpDir, 'worker_empty_dir');
+    await uringFs.mkdir(workerEmptyDir);
+    await uringFs.rmdir(workerEmptyDir, { fallback: 'worker' });
+    assert.equal(await uringFs.exists(workerEmptyDir), false);
+
+    const fsEmptyDir = path.join(tmpDir, 'fs_empty_dir');
+    await uringFs.mkdir(fsEmptyDir);
+    await uringFs.rmdir(fsEmptyDir, { fallback: 'fs' });
+    assert.equal(await uringFs.exists(fsEmptyDir), false);
+    await uringFs.closeFallbackWorkers();
+
+    // 3. Uniform AbortSignal coverage across all APIs
+    const abortedSignal = AbortSignal.abort(new Error('Operation cancelled'));
+
+    await assert.rejects(
+      async () => {
+        await uringFs.readAt(posFile, 0, 10, { signal: abortedSignal });
+      },
+      { name: 'AbortError', code: 'ABORT_ERR' }
+    );
+
+    await assert.rejects(
+      async () => {
+        await uringFs.rmdir(tmpDir, { signal: abortedSignal });
+      },
+      { name: 'AbortError', code: 'ABORT_ERR' }
+    );
+
+    await assert.rejects(
+      async () => {
+        await uringFs.copyFile(posFile, path.join(tmpDir, 'abort_dest.bin'), { signal: abortedSignal });
+      },
+      { name: 'AbortError', code: 'ABORT_ERR' }
+    );
+
+    await assert.rejects(
+      async () => {
+        await uringFs.stat(posFile, { signal: abortedSignal });
+      },
+      { name: 'AbortError', code: 'ABORT_ERR' }
+    );
+
+    await assert.rejects(
+      async () => {
+        await uringFs.lstat(posFile, { signal: abortedSignal });
+      },
+      { name: 'AbortError', code: 'ABORT_ERR' }
+    );
+
+    await assert.rejects(
+      async () => {
+        await uringFs.unlink(posFile, { signal: abortedSignal });
+      },
+      { name: 'AbortError', code: 'ABORT_ERR' }
+    );
+
+    await assert.rejects(
+      async () => {
+        await uringFs.mkdir(path.join(tmpDir, 'abort_mkdir'), { signal: abortedSignal });
+      },
+      { name: 'AbortError', code: 'ABORT_ERR' }
+    );
+
+    await assert.rejects(
+      async () => {
+        await uringFs.rename(posFile, path.join(tmpDir, 'abort_rename'), { signal: abortedSignal });
+      },
+      { name: 'AbortError', code: 'ABORT_ERR' }
+    );
+
+    await assert.rejects(
+      async () => {
+        await uringFs.symlink(posFile, path.join(tmpDir, 'abort_symlink'), { signal: abortedSignal });
+      },
+      { name: 'AbortError', code: 'ABORT_ERR' }
+    );
+
+    await assert.rejects(
+      async () => {
+        await uringFs.link(posFile, path.join(tmpDir, 'abort_link'), { signal: abortedSignal });
+      },
+      { name: 'AbortError', code: 'ABORT_ERR' }
+    );
+
+    await assert.rejects(
+      async () => {
+        await uringFs.fsync(posFile, { signal: abortedSignal });
+      },
+      { name: 'AbortError', code: 'ABORT_ERR' }
+    );
+
+    await assert.rejects(
+      async () => {
+        await uringFs.fdatasync(posFile, { signal: abortedSignal });
+      },
+      { name: 'AbortError', code: 'ABORT_ERR' }
+    );
+  });
 });

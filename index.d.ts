@@ -5,6 +5,7 @@ export type PathLike = string | Buffer | URL;
 
 export interface CustomFsProvider {
   readFile: (path: string, options?: any) => Promise<Buffer | string>;
+  readAt?: (path: string, offset: number, length: number, options?: any) => Promise<Buffer | string>;
   writeFile: (path: string, data: any, options?: any) => Promise<void>;
   appendFile?: (path: string, data: any, options?: any) => Promise<void>;
   copyFile?: (src: string, dest: string, mode?: number) => Promise<void>;
@@ -12,6 +13,7 @@ export interface CustomFsProvider {
   lstat?: (path: string) => Promise<any>;
   access?: (path: string, mode?: number) => Promise<void>;
   unlink: (path: string) => Promise<void>;
+  rmdir?: (path: string, options?: any) => Promise<void>;
   mkdir: (path: string, options?: any) => Promise<string | undefined>;
   rename?: (oldPath: string, newPath: string) => Promise<void>;
   symlink?: (target: string, path: string, type?: string) => Promise<void>;
@@ -37,6 +39,10 @@ export interface UringCommonOptions {
    * Overrides the fallback strategy for this specific call.
    */
   fallback?: FallbackStrategy;
+  /**
+   * An optional AbortSignal to cancel the operation.
+   */
+  signal?: AbortSignal;
 }
 
 export interface UringReadOptions extends UringCommonOptions {
@@ -47,6 +53,17 @@ export interface UringReadOptions extends UringCommonOptions {
    * Setting to 0 disables optimistic read and queries file size via statx first.
    */
   optimisticReadSize?: number;
+}
+
+export interface UringReadAtOptions extends UringCommonOptions {
+  encoding?: BufferEncoding | null;
+  signal?: AbortSignal;
+}
+
+export interface UringRmdirOptions extends UringCommonOptions {
+  maxRetries?: number;
+  retryDelay?: number;
+  signal?: AbortSignal;
 }
 
 export interface UringWriteOptions extends UringCommonOptions {
@@ -156,6 +173,25 @@ export function readFile(
   options?: BufferEncoding | UringReadOptions | null
 ): Promise<Buffer | string>;
 
+export function readAt(
+  path: PathLike,
+  offset: number,
+  length: number,
+  options?: { encoding?: null; signal?: AbortSignal; strict?: boolean; fallback?: FallbackStrategy } | null
+): Promise<Buffer>;
+export function readAt(
+  path: PathLike,
+  offset: number,
+  length: number,
+  options: BufferEncoding | { encoding: BufferEncoding; signal?: AbortSignal; strict?: boolean; fallback?: FallbackStrategy }
+): Promise<string>;
+export function readAt(
+  path: PathLike,
+  offset: number,
+  length: number,
+  options?: BufferEncoding | UringReadAtOptions | null
+): Promise<Buffer | string>;
+
 export function writeFile(
   path: PathLike,
   data: string | Buffer | NodeJS.ArrayBufferView,
@@ -192,6 +228,8 @@ export function access(
 export function exists(path: PathLike, options?: UringAccessOptions): Promise<boolean>;
 
 export function unlink(path: PathLike, options?: UringCommonOptions): Promise<void>;
+
+export function rmdir(path: PathLike, options?: UringRmdirOptions): Promise<void>;
 
 export function mkdir(
   path: PathLike,
@@ -241,6 +279,7 @@ export const COPYFILE_EXCL: number;
 
 declare const _default: {
   readFile: typeof readFile;
+  readAt: typeof readAt;
   writeFile: typeof writeFile;
   appendFile: typeof appendFile;
   copyFile: typeof copyFile;
@@ -249,6 +288,7 @@ declare const _default: {
   access: typeof access;
   exists: typeof exists;
   unlink: typeof unlink;
+  rmdir: typeof rmdir;
   mkdir: typeof mkdir;
   rename: typeof rename;
   symlink: typeof symlink;

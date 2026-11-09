@@ -32,11 +32,13 @@
 
 enum OperationType {
     OP_READ_FILE,
+    OP_READ_AT,
     OP_WRITE_FILE,
     OP_COPY_FILE,
     OP_STAT,
     OP_LSTAT,
     OP_UNLINK,
+    OP_RMDIR,
     OP_MKDIR,
     OP_RENAME,
     OP_SYMLINK,
@@ -58,6 +60,7 @@ enum RequestStage {
     STAGE_CLOSE,
     STAGE_CLOSE_DIRECT,
     STAGE_UNLINK,
+    STAGE_RMDIR,
     STAGE_MKDIR,
     STAGE_RENAME,
     STAGE_SYMLINK,
@@ -176,6 +179,7 @@ struct IORequest {
 
     size_t size;
     size_t offset;
+    uint64_t file_offset;
     size_t write_offset;
     size_t splice_in_pipe;
 
@@ -209,6 +213,7 @@ struct IORequest {
           write_ptr(nullptr),
           size(0),
           offset(0),
+          file_offset(0),
           write_offset(0),
           splice_in_pipe(0),
           saved_errno(0),
@@ -359,11 +364,12 @@ static void PrepSqeForRequest(struct io_uring_sqe* sqe, IORequest* req) {
         case STAGE_READ: {
             size_t remaining = req->size - req->offset;
             unsigned int chunk = remaining > MAX_IO_CHUNK ? static_cast<unsigned int>(MAX_IO_CHUNK) : static_cast<unsigned int>(remaining);
+            uint64_t read_offset = req->file_offset + req->offset;
             if (req->direct_slot >= 0) {
-                io_uring_prep_read(sqe, req->direct_slot, req->buffer + req->offset, chunk, req->offset);
+                io_uring_prep_read(sqe, req->direct_slot, req->buffer + req->offset, chunk, read_offset);
                 sqe->flags |= IOSQE_FIXED_FILE;
             } else {
-                io_uring_prep_read(sqe, req->fd, req->buffer + req->offset, chunk, req->offset);
+                io_uring_prep_read(sqe, req->fd, req->buffer + req->offset, chunk, read_offset);
             }
             break;
         }
@@ -416,6 +422,9 @@ static void PrepSqeForRequest(struct io_uring_sqe* sqe, IORequest* req) {
             break;
         case STAGE_UNLINK:
             io_uring_prep_unlinkat(sqe, AT_FDCWD, req->path.c_str(), 0);
+            break;
+        case STAGE_RMDIR:
+            io_uring_prep_unlinkat(sqe, AT_FDCWD, req->path.c_str(), AT_REMOVEDIR);
             break;
         case STAGE_MKDIR:
             io_uring_prep_mkdirat(sqe, AT_FDCWD, req->path.c_str(), req->mode);
@@ -739,6 +748,75 @@ static bool TryScheduleLinkedReadPair1(IORequest* req) {
     return true;
 }
 
+static bool TryScheduleLinkedReadAt(IORequest* req) {
+    if (!direct_fds_supported) return false;
+
+    uint32_t needed = 3;
+    if (in_flight_sqes + needed > stats.queue_depth) {
+        return false;
+    }
+    if (io_uring_sq_space_left(&ring) < needed && unsubmitted_sqes > 0) {
+        FlushSubmissions();
+    }
+    if (io_uring_sq_space_left(&ring) < needed) {
+        return false;
+    }
+
+    if (req->size > MAX_IO_CHUNK) {
+        return false;
+    }
+
+    int slot = AllocateDirectSlot();
+    if (slot < 0) {
+        return false;
+    }
+
+    if (req->buffer == nullptr) {
+        if (req->size <= default_optimistic_read_size && default_optimistic_read_size > 0) {
+            req->buffer = AcquireReadBuffer(default_optimistic_read_size);
+            req->buffer_capacity = req->buffer ? default_optimistic_read_size : 0;
+        } else {
+            size_t alloc_size = req->size > 0 ? req->size : 1;
+            req->buffer = static_cast<char*>(std::malloc(alloc_size));
+            req->buffer_capacity = req->buffer ? alloc_size : 0;
+        }
+        if (!req->buffer) {
+            FreeDirectSlot(slot);
+            return false;
+        }
+    }
+
+    req->direct_slot = slot;
+    req->is_linked_chain = true;
+    req->pending_linked_cqes = needed;
+    req->linked_stage_index = 0;
+    req->open_succeeded = false;
+    req->offset = 0;
+
+    int open_flags = req->open_flags & ~O_CLOEXEC;
+    unsigned int chunk = static_cast<unsigned int>(req->size);
+
+    struct io_uring_sqe* sqe0 = io_uring_get_sqe(&ring);
+    io_uring_prep_openat_direct(sqe0, AT_FDCWD, req->path.c_str(), open_flags, req->mode, slot);
+    sqe0->flags |= IOSQE_IO_LINK;
+    io_uring_sqe_set_data(sqe0, req);
+
+    struct io_uring_sqe* sqe1 = io_uring_get_sqe(&ring);
+    io_uring_prep_read(sqe1, slot, req->buffer, chunk, req->file_offset);
+    sqe1->flags |= IOSQE_FIXED_FILE | IOSQE_IO_HARDLINK;
+    io_uring_sqe_set_data(sqe1, req);
+
+    struct io_uring_sqe* sqe2 = io_uring_get_sqe(&ring);
+    io_uring_prep_close_direct(sqe2, slot);
+    io_uring_sqe_set_data(sqe2, req);
+
+    unsubmitted_sqes += needed;
+    in_flight_sqes += needed;
+    stats.total_sqes_prepared += needed;
+    StartFlushHooks();
+    return true;
+}
+
 static bool TryScheduleLinkedReadPair2(IORequest* req) {
     uint32_t needed = 2;
     if (in_flight_sqes + needed > stats.queue_depth) {
@@ -759,7 +837,7 @@ static bool TryScheduleLinkedReadPair2(IORequest* req) {
     unsigned int chunk = remaining > MAX_IO_CHUNK ? static_cast<unsigned int>(MAX_IO_CHUNK) : static_cast<unsigned int>(remaining);
 
     struct io_uring_sqe* sqe0 = io_uring_get_sqe(&ring);
-    io_uring_prep_read(sqe0, req->direct_slot, req->buffer + req->offset, chunk, req->offset);
+    io_uring_prep_read(sqe0, req->direct_slot, req->buffer + req->offset, chunk, req->file_offset + req->offset);
     sqe0->flags |= IOSQE_FIXED_FILE | IOSQE_IO_LINK;
     io_uring_sqe_set_data(sqe0, req);
 
@@ -812,6 +890,8 @@ static void ScheduleStage(IORequest* req) {
                 if (TryScheduleLinkedFsync(req)) return;
             } else if (req->op == OP_READ_FILE) {
                 if (TryScheduleLinkedReadPair1(req)) return;
+            } else if (req->op == OP_READ_AT) {
+                if (TryScheduleLinkedReadAt(req)) return;
             }
         }
 
@@ -887,6 +967,14 @@ static void DrainPendingQueue() {
                 }
             } else if (req->op == OP_READ_FILE) {
                 if (TryScheduleLinkedReadPair1(req)) {
+                    pending_queue.pop_front();
+                    continue;
+                }
+                if (direct_fds_supported) {
+                    break;
+                }
+            } else if (req->op == OP_READ_AT) {
+                if (TryScheduleLinkedReadAt(req)) {
                     pending_queue.pop_front();
                     continue;
                 }
@@ -1275,6 +1363,54 @@ static void ProcessCompletions() {
                     continue;
                 }
 
+                if (req->op == OP_READ_AT) {
+                    if (cqe_idx == 0) {
+                        if (res < 0) {
+                            req->saved_errno = -res;
+                            req->failed_syscall = "open";
+                        } else {
+                            req->open_succeeded = true;
+                        }
+                    } else if (cqe_idx == 1) {
+                        if (res < 0) {
+                            if (req->saved_errno == 0 && -res != ECANCELED && -res != EINTR && -res != EAGAIN) {
+                                req->saved_errno = -res;
+                                req->failed_syscall = "read";
+                            }
+                        } else {
+                            req->offset += static_cast<size_t>(res);
+                        }
+                    } else if (cqe_idx == 2) {
+                        if (res < 0 && req->saved_errno == 0 && -res != ECANCELED) {
+                            req->saved_errno = -res;
+                            req->failed_syscall = "close";
+                        }
+                    }
+
+                    if (req->pending_linked_cqes == 0) {
+                        req->is_linked_chain = false;
+                        if (!req->open_succeeded) {
+                            FreeDirectSlot(req->direct_slot);
+                            req->direct_slot = -1;
+                            finished_requests.push_back(req);
+                        } else if (req->saved_errno != 0) {
+                            FreeDirectSlot(req->direct_slot);
+                            req->direct_slot = -1;
+                            finished_requests.push_back(req);
+                        } else if (-res == ECANCELED) {
+                            req->size = req->offset;
+                            req->stage = STAGE_CLOSE_DIRECT;
+                            ScheduleStage(req);
+                        } else {
+                            req->size = req->offset;
+                            FreeDirectSlot(req->direct_slot);
+                            req->direct_slot = -1;
+                            finished_requests.push_back(req);
+                        }
+                    }
+                    continue;
+                }
+
                 if (req->op == OP_READ_FILE) {
                     if (req->optimistic_read) {
                         // Unified Pair 1 (Optimistic): 0: openat_direct, 1: read(optimistic_read_size)
@@ -1451,6 +1587,28 @@ static void ProcessCompletions() {
                             ScheduleStage(req);
                         } else if (req->op == OP_FSYNC) {
                             req->stage = STAGE_FSYNC;
+                            ScheduleStage(req);
+                        } else if (req->op == OP_READ_AT) {
+                            if (req->buffer == nullptr) {
+                                if (req->size <= default_optimistic_read_size && default_optimistic_read_size > 0) {
+                                    req->buffer = AcquireReadBuffer(default_optimistic_read_size);
+                                    req->buffer_capacity = req->buffer ? default_optimistic_read_size : 0;
+                                } else {
+                                    size_t alloc_size = req->size > 0 ? req->size : 1;
+                                    req->buffer = static_cast<char*>(std::malloc(alloc_size));
+                                    req->buffer_capacity = req->buffer ? alloc_size : 0;
+                                }
+                                if (!req->buffer) {
+                                    req->saved_errno = ENOMEM;
+                                    req->failed_syscall = "read";
+                                    EnqueueAsyncClose(req->fd);
+                                    req->fd = -1;
+                                    finished_requests.push_back(req);
+                                    break;
+                                }
+                            }
+                            req->offset = 0;
+                            req->stage = STAGE_READ;
                             ScheduleStage(req);
                         } else if (req->op == OP_WRITE_FILE) {
                             if (req->size == 0) {
@@ -1884,6 +2042,15 @@ static void ProcessCompletions() {
                     break;
                 }
 
+                case STAGE_RMDIR: {
+                    if (res < 0) {
+                        req->saved_errno = -res;
+                        req->failed_syscall = "rmdir";
+                    }
+                    finished_requests.push_back(req);
+                    break;
+                }
+
                 case STAGE_MKDIR: {
                     if (res < 0) {
                         req->saved_errno = -res;
@@ -1944,10 +2111,11 @@ static void ProcessCompletions() {
                 );
             } else {
                 switch (req->op) {
-                    case OP_READ_FILE: {
+                    case OP_READ_FILE:
+                    case OP_READ_AT: {
                         if (req->size == 0 || !req->buffer) {
                             req->deferred.Resolve(Napi::Buffer<char>::New(req->env, 0));
-                        } else if (req->size <= 16384 && req->buffer_capacity > 0 && req->buffer_capacity == default_optimistic_read_size) {
+                        } else if (req->buffer_capacity > 0 && req->buffer_capacity == default_optimistic_read_size && req->size <= default_optimistic_read_size) {
                             Napi::Buffer<char> out = Napi::Buffer<char>::Copy(req->env, req->buffer, req->size);
                             req->deferred.Resolve(out);
                         } else {
@@ -1982,6 +2150,7 @@ static void ProcessCompletions() {
                     }
                     case OP_COPY_FILE:
                     case OP_UNLINK:
+                    case OP_RMDIR:
                     case OP_MKDIR:
                     case OP_RENAME:
                     case OP_SYMLINK:
@@ -2039,6 +2208,48 @@ Napi::Value ReadFileUring(const Napi::CallbackInfo& info) {
     IORequest* req = new IORequest(env, OP_READ_FILE, STAGE_OPEN, filePath);
     req->open_flags = O_RDONLY;
     req->optimistic_read_size = optimisticSize;
+    Napi::Promise promise = req->deferred.Promise();
+
+    if (!EnsureCredentialsSafe(env)) {
+        req->deferred.Reject(CreateErrnoError(env, EPERM, "io_uring", filePath));
+        delete req;
+        return promise;
+    }
+
+    active_requests++;
+    stats.total_requests++;
+    RefEventLoopIfNeeded();
+    ScheduleStage(req);
+
+    return promise;
+}
+
+Napi::Value ReadAtUring(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 3 || !info[0].IsString() || !info[1].IsNumber() || !info[2].IsNumber()) {
+        Napi::TypeError::New(env, "Expected arguments: (path: string, offset: number, length: number)").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    std::string filePath = info[0].As<Napi::String>().Utf8Value();
+    int64_t fileOffsetVal = info[1].As<Napi::Number>().Int64Value();
+    int64_t lengthVal = info[2].As<Napi::Number>().Int64Value();
+
+    if (fileOffsetVal < 0) {
+        Napi::RangeError::New(env, "The 'offset' argument must be >= 0").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    if (lengthVal < 0) {
+        Napi::RangeError::New(env, "The 'length' argument must be >= 0").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    IORequest* req = new IORequest(env, OP_READ_AT, STAGE_OPEN, filePath);
+    req->open_flags = O_RDONLY;
+    req->file_offset = static_cast<uint64_t>(fileOffsetVal);
+    req->size = static_cast<size_t>(lengthVal);
+    req->offset = 0;
     Napi::Promise promise = req->deferred.Promise();
 
     if (!EnsureCredentialsSafe(env)) {
@@ -2271,6 +2482,32 @@ Napi::Value UnlinkUring(const Napi::CallbackInfo& info) {
 
     if (!EnsureCredentialsSafe(env)) {
         req->deferred.Reject(CreateErrnoError(env, EPERM, "io_uring", filePath));
+        delete req;
+        return promise;
+    }
+
+    active_requests++;
+    stats.total_requests++;
+    RefEventLoopIfNeeded();
+    ScheduleStage(req);
+
+    return promise;
+}
+
+Napi::Value RmdirUring(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 1 || !info[0].IsString()) {
+        Napi::TypeError::New(env, "The 'path' argument must be a string").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    std::string dirPath = info[0].As<Napi::String>().Utf8Value();
+    IORequest* req = new IORequest(env, OP_RMDIR, STAGE_RMDIR, dirPath);
+    Napi::Promise promise = req->deferred.Promise();
+
+    if (!EnsureCredentialsSafe(env)) {
+        req->deferred.Reject(CreateErrnoError(env, EPERM, "io_uring", dirPath));
         delete req;
         return promise;
     }
@@ -2542,6 +2779,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     }
 
     exports.Set("readFile", Napi::Function::New(env, ReadFileUring));
+    exports.Set("readAt", Napi::Function::New(env, ReadAtUring));
     exports.Set("setOptimisticReadSize", Napi::Function::New(env, SetOptimisticReadSize));
     exports.Set("writeFile", Napi::Function::New(env, WriteFileUring));
     exports.Set("copyFile", Napi::Function::New(env, CopyFileUring));
@@ -2549,6 +2787,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("lstat", Napi::Function::New(env, LstatUring));
     exports.Set("access", Napi::Function::New(env, AccessUring));
     exports.Set("unlink", Napi::Function::New(env, UnlinkUring));
+    exports.Set("rmdir", Napi::Function::New(env, RmdirUring));
     exports.Set("mkdir", Napi::Function::New(env, MkdirUring));
     exports.Set("rename", Napi::Function::New(env, RenameUring));
     exports.Set("symlink", Napi::Function::New(env, SymlinkUring));

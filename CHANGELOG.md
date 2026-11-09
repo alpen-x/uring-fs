@@ -5,6 +5,28 @@ All notable changes to `uring-fs` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-11-08
+
+### Added
+- **Positional Read (`readAt(filePath, offset, length, options?)`):**
+  - High-performance random access positional file reads via a 3-SQE kernel linked chain (`openat_direct(slot) -> read(slot, len, offset) -> close_direct(slot)`).
+  - Uses `IOSQE_IO_HARDLINK` on the read SQE to ensure `close_direct` executes atomically within the same kernel roundtrip even on EOF short reads.
+  - Slices only the exact requested bytes, preventing unnecessary memory allocation during partial file inspection (critical for `.safetensors`, GGUF weights, parquet files, and embedded vector indices).
+  - Full support for string encodings (`'utf8'`, etc.), `AbortSignal`, and 3-tier fallback parity (`worker`, `node:fs`, custom providers).
+- **1-SQE `rmdir(path, options?)` via `io_uring_prep_unlinkat`:**
+  - Fast empty directory removal in a single io_uring SQE using `AT_REMOVEDIR`.
+  - Standard POSIX error behavior (`ENOTEMPTY`/`EEXIST` when directory is not empty, `ENOENT` when missing).
+  - Supported across `io_uring`, dedicated worker threads, and `node:fs` fallbacks.
+- **Uniform `AbortSignal` Support Across All APIs:**
+  - Added pre-aborted signal checks and asynchronous cancellation wrapping across `copyFile`, `stat`, `lstat`, `unlink`, `rmdir`, `mkdir`, `rename`, `symlink`, `link`, `fsync`, and `fdatasync`.
+  - Consistent `AbortError` (`ABORT_ERR`) with `cause` preserved from `signal.reason`.
+
+### Changed & Optimized
+- **Hot Buffer Recycling for Optimistic Reads (`src/addon.cc`):**
+  - By copying small read results to V8 Buffers and recycling the underlying 64 KB buffers directly into `optimistic_buffer_pool`, subsequent reads no longer suffer `std::malloc`/`std::free` heap overhead.
+- **Upgraded CI / GitHub Actions Workflows:**
+  - Target Node 24 with `@v7` actions, updated provenance and trusted publishing configurations.
+
 ## [1.2.0] - 2026-11-03
 
 ### Added

@@ -74,6 +74,7 @@ sudo pacman -S liburing base-devel
 ```js
 import {
   readFile,
+  readAt,
   writeFile,
   appendFile,
   copyFile,
@@ -82,6 +83,7 @@ import {
   access,
   exists,
   mkdir,
+  rmdir,
   rename,
   symlink,
   link,
@@ -126,6 +128,7 @@ await unlink('hello.txt');
 | Function | Kernel `io_uring` Opcode(s) | Description |
 | :--- | :--- | :--- |
 | `readFile(path, options?)` | `OPENAT_DIRECT` ➔ `READ` ➔ `CLOSE_DIRECT` *(Optimistic <64KB)*<br>`OPENAT_DIRECT` ➔ `STATX` ➔ `READ` ➔ `CLOSE_DIRECT` *(Large)* | Reads entire file with configurable `optimisticReadSize` and zero-copy V8 handoff |
+| `readAt(path, offset, length, options?)` | `OPENAT_DIRECT` ➔ `READ` ➔ `CLOSE_DIRECT` *(`IOSQE_IO_HARDLINK`)* | Reads exact file slice at byte offset without thread pool or file table overhead |
 | `writeFile(path, data, options?)` | `OPENAT_DIRECT` ➔ `WRITE` (➔ `FSYNC`) ➔ `CLOSE_DIRECT` *(`IOSQE_IO_LINK`)* | Writes `string`, `Buffer`, or `Uint8Array` in a single linked kernel chain |
 | `appendFile(path, data, options?)` | `OPENAT_DIRECT(O_APPEND)` ➔ `WRITE` ➔ `CLOSE_DIRECT` *(`IOSQE_IO_LINK`)* | Appends data atomically at end of file |
 | `copyFile(src, dest, mode?)` | `OPENAT` ➔ `STATX` ➔ `SPLICE` ➔ `CLOSE` | Zero-copy kernel-to-kernel copy via `io_uring_prep_splice` |
@@ -139,6 +142,7 @@ await unlink('hello.txt');
 | `fsync(path, options?)` | `OPENAT_DIRECT` ➔ `FSYNC` (`0`) ➔ `CLOSE_DIRECT` *(`IOSQE_IO_LINK`)* | Flushes modified file data and metadata to disk |
 | `fdatasync(path, options?)` | `OPENAT_DIRECT` ➔ `FSYNC` (`DATASYNC`) ➔ `CLOSE_DIRECT` *(`IOSQE_IO_LINK`)* | Flushes modified file data to disk |
 | `mkdir(path, options?)` | `MKDIRAT` | Creates a directory (single or `{ recursive: true }`) |
+| `rmdir(path, options?)` | `UNLINKAT` (`AT_REMOVEDIR`) *(1-SQE)* | Removes an empty directory |
 | `unlink(path, options?)` | `UNLINKAT` | Removes a file or symbolic link |
 | `setOptimisticReadSize(bytes)` | *(Configuration)* | Sets default optimistic read buffer size in bytes (`0` disables) |
 
