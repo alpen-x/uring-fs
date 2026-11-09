@@ -435,9 +435,9 @@ class UringStats {
     this.mtime = new Date(raw.mtimeMs);
     this.ctime = new Date(raw.ctimeMs);
     this.birthtime = new Date(raw.birthtimeMs);
-    this._isFile = raw.isFile;
-    this._isDirectory = raw.isDirectory;
-    this._isSymbolicLink = raw.isSymbolicLink;
+    this._isFile = typeof raw.isFile === 'function' ? raw.isFile() : Boolean(raw.isFile);
+    this._isDirectory = typeof raw.isDirectory === 'function' ? raw.isDirectory() : Boolean(raw.isDirectory);
+    this._isSymbolicLink = typeof raw.isSymbolicLink === 'function' ? raw.isSymbolicLink() : Boolean(raw.isSymbolicLink);
   }
 
   isFile() {

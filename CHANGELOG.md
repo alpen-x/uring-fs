@@ -5,6 +5,11 @@ All notable changes to `uring-fs` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-11-09
+
+### Fixed
+- **`UringStats` Fallback Predicate Normalization**: Fixed `UringStats` constructor when wrapping `node:fs` `Stats` objects returned by fallback `UringFileHandle.prototype.stat()` on non-`io_uring` environments (such as macOS or stub builds), ensuring `.isFile()`, `.isDirectory()`, and `.isSymbolicLink()` evaluate to booleans rather than function references.
+
 ## [1.3.0] - 2026-11-09
 
 ### Added
