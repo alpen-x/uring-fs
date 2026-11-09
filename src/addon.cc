@@ -364,6 +364,9 @@ static void PrepSqeForRequest(struct io_uring_sqe* sqe, IORequest* req) {
         case STAGE_READ: {
             size_t remaining = req->size - req->offset;
             unsigned int chunk = remaining > MAX_IO_CHUNK ? static_cast<unsigned int>(MAX_IO_CHUNK) : static_cast<unsigned int>(remaining);
+            if (chunk == 0 && req->op == OP_READ_AT) {
+                chunk = 1;
+            }
             uint64_t read_offset = req->file_offset + req->offset;
             if (req->direct_slot >= 0) {
                 io_uring_prep_read(sqe, req->direct_slot, req->buffer + req->offset, chunk, read_offset);
@@ -794,7 +797,7 @@ static bool TryScheduleLinkedReadAt(IORequest* req) {
     req->offset = 0;
 
     int open_flags = req->open_flags & ~O_CLOEXEC;
-    unsigned int chunk = static_cast<unsigned int>(req->size);
+    unsigned int chunk = req->size > 0 ? static_cast<unsigned int>(req->size) : 1;
 
     struct io_uring_sqe* sqe0 = io_uring_get_sqe(&ring);
     io_uring_prep_openat_direct(sqe0, AT_FDCWD, req->path.c_str(), open_flags, req->mode, slot);
@@ -978,7 +981,7 @@ static void DrainPendingQueue() {
                     pending_queue.pop_front();
                     continue;
                 }
-                if (direct_fds_supported) {
+                if (direct_fds_supported && req->size <= MAX_IO_CHUNK) {
                     break;
                 }
             }
@@ -1373,11 +1376,11 @@ static void ProcessCompletions() {
                         }
                     } else if (cqe_idx == 1) {
                         if (res < 0) {
-                            if (req->saved_errno == 0 && -res != ECANCELED && -res != EINTR && -res != EAGAIN) {
+                            if (req->saved_errno == 0 && -res != ECANCELED) {
                                 req->saved_errno = -res;
                                 req->failed_syscall = "read";
                             }
-                        } else {
+                        } else if (req->size > 0) {
                             req->offset += static_cast<size_t>(res);
                         }
                     } else if (cqe_idx == 2) {
@@ -1946,7 +1949,9 @@ static void ProcessCompletions() {
                             finished_requests.push_back(req);
                         }
                     } else {
-                        req->offset += static_cast<size_t>(res);
+                        if (req->size > 0) {
+                            req->offset += static_cast<size_t>(res);
+                        }
                         if (req->offset < req->size) {
                             ScheduleStage(req);
                         } else {
@@ -1985,7 +1990,9 @@ static void ProcessCompletions() {
                             ScheduleStage(req);
                         }
                     } else {
-                        req->offset += static_cast<size_t>(res);
+                        if (req->size > 0) {
+                            req->offset += static_cast<size_t>(res);
+                        }
                         if (req->offset < req->size) {
                             ScheduleStage(req);
                         } else {

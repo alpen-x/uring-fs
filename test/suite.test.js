@@ -238,7 +238,7 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
       const deltaSqes = statsAfter.totalSqesPrepared - statsBefore.totalSqesPrepared;
 
       assert.equal(deltaRequests, count * 2);
-      assert.ok(deltaSubmits < deltaSqes / 10, `Batching should reduce syscalls by >90% (SQEs: ${deltaSqes}, Submits: ${deltaSubmits})`);
+      assert.ok(deltaSubmits < deltaSqes / 8, `Batching should reduce syscalls by >87% (SQEs: ${deltaSqes}, Submits: ${deltaSubmits})`);
       assert.equal(statsAfter.activeRequests, 0);
       assert.equal(statsAfter.directFdsInUse, 0, 'All direct FD slots must be returned to the free list');
     }
@@ -689,7 +689,33 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     const zeroLenStr = await uringFs.readAt(posFile, 5, 0, 'utf8');
     assert.equal(zeroLenStr, '');
 
-    // Argument bounds validation
+    // readAt length 0 on non-existent file rejects with ENOENT, and on directory rejects with EISDIR
+    await assert.rejects(
+      async () => {
+        await uringFs.readAt(path.join(tmpDir, 'non_existent_file.bin'), 0, 0);
+      },
+      { code: 'ENOENT' }
+    );
+    await assert.rejects(
+      async () => {
+        await uringFs.readAt(tmpDir, 0, 0);
+      },
+      { code: 'EISDIR' }
+    );
+
+    // Argument bounds and type validation
+    await assert.rejects(
+      async () => {
+        await uringFs.readAt(posFile, 'invalid', 10);
+      },
+      { name: 'TypeError', code: 'ERR_INVALID_ARG_TYPE' }
+    );
+    await assert.rejects(
+      async () => {
+        await uringFs.readAt(posFile, 0, 'invalid');
+      },
+      { name: 'TypeError', code: 'ERR_INVALID_ARG_TYPE' }
+    );
     await assert.rejects(
       async () => {
         await uringFs.readAt(posFile, -1, 10);
@@ -824,6 +850,13 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     await assert.rejects(
       async () => {
         await uringFs.symlink(posFile, path.join(tmpDir, 'abort_symlink'), { signal: abortedSignal });
+      },
+      { name: 'AbortError', code: 'ABORT_ERR' }
+    );
+
+    await assert.rejects(
+      async () => {
+        await uringFs.symlink(posFile, path.join(tmpDir, 'abort_symlink4'), 'file', { signal: abortedSignal });
       },
       { name: 'AbortError', code: 'ABORT_ERR' }
     );

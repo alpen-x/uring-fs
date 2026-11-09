@@ -472,13 +472,23 @@ async function readFile(filePath, options) {
  * @returns {Promise<Buffer | string>}
  */
 async function readAt(filePath, offset, length, options) {
-  if (typeof offset !== 'number' || !Number.isFinite(offset) || !Number.isInteger(offset) || offset < 0) {
-    const err = new RangeError(`The "offset" argument must be a non-negative integer. Received ${offset}`);
+  if (typeof offset !== 'number') {
+    const err = new TypeError(`The "offset" argument must be of type number. Received ${typeof offset}`);
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+  if (!Number.isFinite(offset) || !Number.isInteger(offset) || offset < 0) {
+    const err = new RangeError(`The value of "offset" is out of range. It must be an integer >= 0. Received ${offset}`);
     err.code = 'ERR_OUT_OF_RANGE';
     throw err;
   }
-  if (typeof length !== 'number' || !Number.isFinite(length) || !Number.isInteger(length) || length < 0) {
-    const err = new RangeError(`The "length" argument must be a non-negative integer. Received ${length}`);
+  if (typeof length !== 'number') {
+    const err = new TypeError(`The "length" argument must be of type number. Received ${typeof length}`);
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+  if (!Number.isFinite(length) || !Number.isInteger(length) || length < 0) {
+    const err = new RangeError(`The value of "length" is out of range. It must be an integer >= 0. Received ${length}`);
     err.code = 'ERR_OUT_OF_RANGE';
     throw err;
   }
@@ -501,28 +511,50 @@ async function readAt(filePath, offset, length, options) {
 
   const normalized = normalizePath(filePath);
 
-  if (length === 0) {
-    return encoding ? '' : Buffer.alloc(0);
-  }
-
   const backend = selectExecutionBackend(typeof options === 'object' ? options : undefined);
 
   if (backend.type === 'provider') {
     if (typeof backend.provider.open === 'function') {
-      const fh = await wrapWithAbortSignal(backend.provider.open(normalized, 'r'), signal);
+      const openPromise = backend.provider.open(normalized, 'r');
+      if (signal) {
+        openPromise.then(
+          (fh) => {
+            if (signal.aborted && fh && typeof fh.close === 'function') {
+              fh.close().catch(() => {});
+            }
+          },
+          () => {}
+        );
+      }
+      const fh = await wrapWithAbortSignal(openPromise, signal);
       try {
+        if (length === 0) {
+          if (typeof fh.stat === 'function') {
+            const st = await wrapWithAbortSignal(fh.stat(), signal);
+            if (st && typeof st.isDirectory === 'function' && st.isDirectory()) {
+              const err = new Error('EISDIR: illegal operation on a directory, read');
+              err.code = 'EISDIR';
+              err.errno = -21;
+              err.syscall = 'read';
+              throw err;
+            }
+          }
+          await wrapWithAbortSignal(fh.read(Buffer.alloc(1), 0, 0, offset), signal);
+          return encoding ? '' : Buffer.alloc(0);
+        }
         const buf = Buffer.allocUnsafe(length);
         const { bytesRead } = await wrapWithAbortSignal(fh.read(buf, 0, length, offset), signal);
         const resultBuf = bytesRead < length ? buf.subarray(0, bytesRead) : buf;
         return encoding ? resultBuf.toString(encoding) : resultBuf;
       } finally {
-        await fh.close();
+        await fh.close().catch(() => {});
       }
     }
     const fullBuf = await wrapWithAbortSignal(backend.provider.readFile(normalized), signal);
-    const start = Math.min(offset, fullBuf.length);
-    const end = Math.min(offset + length, fullBuf.length);
-    const slice = fullBuf.subarray(start, end);
+    const rawBuf = Buffer.isBuffer(fullBuf) ? fullBuf : Buffer.from(String(fullBuf));
+    const start = Math.min(offset, rawBuf.length);
+    const end = Math.min(offset + length, rawBuf.length);
+    const slice = rawBuf.subarray(start, end);
     return encoding ? slice.toString(encoding) : slice;
   }
 
@@ -801,7 +833,10 @@ async function rmdir(dirPath, options) {
   const backend = selectExecutionBackend(options);
 
   if (backend.type === 'provider') {
-    return wrapWithAbortSignal(backend.provider.rmdir(normalized, options), signal);
+    if (typeof backend.provider.rmdir === 'function') {
+      return wrapWithAbortSignal(backend.provider.rmdir(normalized, options), signal);
+    }
+    return wrapWithAbortSignal(fsPromises.rmdir(normalized, options), signal);
   }
 
   if (backend.type === 'worker') {
@@ -906,9 +941,13 @@ async function rename(oldPath, newPath, options) {
 /**
  * Creates a symbolic link asynchronously via io_uring symlinkat.
  */
-async function symlink(target, linkPath, typeOrOptions) {
-  const type = typeof typeOrOptions === 'string' ? typeOrOptions : undefined;
-  const options = typeof typeOrOptions === 'object' && typeOrOptions !== null ? typeOrOptions : undefined;
+async function symlink(target, linkPath, typeOrOptions, optionsArg) {
+  const type = typeof typeOrOptions === 'string'
+    ? typeOrOptions
+    : (typeOrOptions && typeof typeOrOptions === 'object' && typeof typeOrOptions.type === 'string' ? typeOrOptions.type : undefined);
+  const options = typeof optionsArg === 'object' && optionsArg !== null
+    ? optionsArg
+    : (typeof typeOrOptions === 'object' && typeOrOptions !== null ? typeOrOptions : undefined);
   const signal = options ? options.signal : undefined;
   if (signal && signal.aborted) {
     throw createAbortError(signal);
@@ -971,11 +1010,25 @@ async function fsync(filePath, options) {
     if (typeof backend.provider.fsync === 'function') {
       return wrapWithAbortSignal(backend.provider.fsync(normalized), signal);
     }
-    const fh = await wrapWithAbortSignal(fsPromises.open(normalized, 'r'), signal);
+    const openFn = typeof backend.provider.open === 'function'
+      ? backend.provider.open.bind(backend.provider)
+      : fsPromises.open;
+    const openPromise = openFn(normalized, 'r');
+    if (signal) {
+      openPromise.then(
+        (fh) => {
+          if (signal.aborted && fh && typeof fh.close === 'function') {
+            fh.close().catch(() => {});
+          }
+        },
+        () => {}
+      );
+    }
+    const fh = await wrapWithAbortSignal(openPromise, signal);
     try {
       await wrapWithAbortSignal(fh.sync(), signal);
     } finally {
-      await fh.close();
+      await fh.close().catch(() => {});
     }
     return;
   }
@@ -1004,11 +1057,25 @@ async function fdatasync(filePath, options) {
     if (typeof backend.provider.fdatasync === 'function') {
       return wrapWithAbortSignal(backend.provider.fdatasync(normalized), signal);
     }
-    const fh = await wrapWithAbortSignal(fsPromises.open(normalized, 'r'), signal);
+    const openFn = typeof backend.provider.open === 'function'
+      ? backend.provider.open.bind(backend.provider)
+      : fsPromises.open;
+    const openPromise = openFn(normalized, 'r');
+    if (signal) {
+      openPromise.then(
+        (fh) => {
+          if (signal.aborted && fh && typeof fh.close === 'function') {
+            fh.close().catch(() => {});
+          }
+        },
+        () => {}
+      );
+    }
+    const fh = await wrapWithAbortSignal(openPromise, signal);
     try {
       await wrapWithAbortSignal(fh.datasync(), signal);
     } finally {
-      await fh.close();
+      await fh.close().catch(() => {});
     }
     return;
   }

@@ -4,6 +4,7 @@ import { URL } from 'node:url';
 export type PathLike = string | Buffer | URL;
 
 export interface CustomFsProvider {
+  open?: (path: string, flags?: string, mode?: number) => Promise<any>;
   readFile: (path: string, options?: any) => Promise<Buffer | string>;
   readAt?: (path: string, offset: number, length: number, options?: any) => Promise<Buffer | string>;
   writeFile: (path: string, data: any, options?: any) => Promise<void>;
@@ -245,7 +246,8 @@ export function rename(
 export function symlink(
   target: PathLike,
   path: PathLike,
-  typeOrOptions?: string | UringCommonOptions
+  type?: string | null | UringCommonOptions,
+  options?: UringCommonOptions
 ): Promise<void>;
 
 export function link(

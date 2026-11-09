@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed & Optimized
 - **Hot Buffer Recycling for Optimistic Reads (`src/addon.cc`):**
   - By copying small read results to V8 Buffers and recycling the underlying 64 KB buffers directly into `optimistic_buffer_pool`, subsequent reads no longer suffer `std::malloc`/`std::free` heap overhead.
+- **Hardened `readAt`, `symlink`, and Custom Provider Fallbacks:**
+  - Enforced strict `TypeError` (`ERR_INVALID_ARG_TYPE`) vs `RangeError` (`ERR_OUT_OF_RANGE`) validation on `readAt` `offset` and `length`, and unified 0-byte `readAt` behavior (`ENOENT` on missing files, `EISDIR` on directories) across `io_uring`, `worker`, and `node:fs`.
+  - Added 4-argument `symlink(target, path, type, options)` support and in-flight `AbortSignal` file handle cleanup for custom providers in `readAt`, `fsync`, and `fdatasync`.
 - **Upgraded CI / GitHub Actions Workflows:**
   - Target Node 24 with `@v7` actions, updated provenance and trusted publishing configurations.
 
