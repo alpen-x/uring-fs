@@ -5,6 +5,17 @@ All notable changes to `uring-fs` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - 2026-11-09
+
+### Fixed & Hardened
+- **Strict 0-Byte `readAt` Parity (`src/addon.cc`, `index.js`, `lib/worker_fallback.js`):**
+  - Unified 0-byte `readAt` behavior across `io_uring`, `worker`, and `node:fs` backends so reading 0 bytes from a missing file rejects with `ENOENT` and reading 0 bytes from a directory rejects with `EISDIR`.
+  - Separated `TypeError` (`ERR_INVALID_ARG_TYPE`) from `RangeError` (`ERR_OUT_OF_RANGE`) when validating `offset` and `length`.
+  - Removed suppression of `EINTR`/`EAGAIN` in linked `OP_READ_AT` CQE 1 and prevented head-of-line queue blocking for `readAt` requests exceeding `MAX_IO_CHUNK` in `DrainPendingQueue`.
+- **4-Argument `symlink` & Custom Provider Hardening (`index.js`, `index.d.ts`):**
+  - Added 4-argument `symlink(target, path, type, options)` support and TypeScript overload.
+  - Added in-flight `AbortSignal` file handle cleanup and guarded `fh.close()` in `readAt`, `fsync`, and `fdatasync` custom provider fallbacks, plus safe `rmdir` fallback when omitted by custom providers.
+
 ## [1.2.1] - 2026-11-08
 
 ### Added
@@ -24,9 +35,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed & Optimized
 - **Hot Buffer Recycling for Optimistic Reads (`src/addon.cc`):**
   - By copying small read results to V8 Buffers and recycling the underlying 64 KB buffers directly into `optimistic_buffer_pool`, subsequent reads no longer suffer `std::malloc`/`std::free` heap overhead.
-- **Hardened `readAt`, `symlink`, and Custom Provider Fallbacks:**
-  - Enforced strict `TypeError` (`ERR_INVALID_ARG_TYPE`) vs `RangeError` (`ERR_OUT_OF_RANGE`) validation on `readAt` `offset` and `length`, and unified 0-byte `readAt` behavior (`ENOENT` on missing files, `EISDIR` on directories) across `io_uring`, `worker`, and `node:fs`.
-  - Added 4-argument `symlink(target, path, type, options)` support and in-flight `AbortSignal` file handle cleanup for custom providers in `readAt`, `fsync`, and `fdatasync`.
 - **Upgraded CI / GitHub Actions Workflows:**
   - Target Node 24 with `@v7` actions, updated provenance and trusted publishing configurations.
 
