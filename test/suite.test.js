@@ -2020,8 +2020,17 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
 
       if (fs.existsSync(prebuildPath)) {
         const installScript = path.join(__dirname, '..', 'scripts', 'install.js');
+        const cleanEnv = {
+          ...process.env,
+          URING_FS_BUILD_FROM_SOURCE: '0',
+          URING_FS_IGNORE_PREBUILDS: '0',
+          URING_FS_MARCH_NATIVE: '0',
+          npm_config_build_from_source: '',
+          npm_config_march_native: '',
+        };
         const installRes = spawnSync(process.execPath, [installScript], {
           cwd: path.join(__dirname, '..'),
+          env: cleanEnv,
           encoding: 'utf8',
         });
         assert.equal(installRes.status, 0);
@@ -2033,7 +2042,7 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
           ['-e', 'const u = require("./index.js"); console.log("SUPPORTED:", u.isUringSupported());'],
           {
             cwd: path.join(__dirname, '..'),
-            env: { ...process.env, URING_FS_PREBUILD_ONLY: '1' },
+            env: { ...cleanEnv, URING_FS_PREBUILD_ONLY: '1' },
             encoding: 'utf8',
           }
         );
