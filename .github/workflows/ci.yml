@@ -47,6 +47,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-latest]
+    env:
+      URING_FS_BUILD_FROM_SOURCE: '1'
+      URING_FS_IGNORE_PREBUILDS: '1'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7

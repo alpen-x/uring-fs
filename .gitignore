@@ -1,5 +1,6 @@
 node_modules/
 build/
+prebuilds/
 bench_tmp/
 hello_uring
 test_poll_uring

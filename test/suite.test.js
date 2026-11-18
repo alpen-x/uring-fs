@@ -1996,4 +1996,65 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     const srHandle = await uringFs.open(testFile, 'sr', { fallback: 'fs' });
     await srHandle.close();
   });
+
+  test('23. v1.3.2 Static liburing.a, Hidden ELF Symbols, detectLibc, and Prebuilds Fast-Path', async () => {
+    const { spawnSync } = require('node:child_process');
+
+    // A. detectLibc verification
+    assert.equal(typeof uringFs.detectLibc, 'function');
+    const libc = uringFs.detectLibc();
+    if (process.platform === 'linux') {
+      assert.ok(libc === 'glibc' || libc === 'musl', `Expected 'glibc' or 'musl', got ${libc}`);
+    } else {
+      assert.equal(libc, null);
+    }
+
+    // B. Prebuilds resolution & scripts/install.js fast-path verification on Linux
+    if (process.platform === 'linux') {
+      const prebuildPath = path.join(__dirname, '..', 'prebuilds', `linux-${process.arch}`, `uring_fs.${libc}.node`);
+      const buildPath = path.join(__dirname, '..', 'build', 'Release', 'uring_fs.node');
+      if (fs.existsSync(buildPath) && !fs.existsSync(prebuildPath)) {
+        fs.mkdirSync(path.dirname(prebuildPath), { recursive: true });
+        fs.copyFileSync(buildPath, prebuildPath);
+      }
+
+      if (fs.existsSync(prebuildPath)) {
+        const installScript = path.join(__dirname, '..', 'scripts', 'install.js');
+        const installRes = spawnSync(process.execPath, [installScript], {
+          cwd: path.join(__dirname, '..'),
+          encoding: 'utf8',
+        });
+        assert.equal(installRes.status, 0);
+        assert.match(installRes.stdout, /\[uring-fs\] Using prebuilt native binary/);
+
+        // Verify loading solely from prebuilds when URING_FS_PREBUILD_ONLY=1
+        const prebuildOnlyRes = spawnSync(
+          process.execPath,
+          ['-e', 'const u = require("./index.js"); console.log("SUPPORTED:", u.isUringSupported());'],
+          {
+            cwd: path.join(__dirname, '..'),
+            env: { ...process.env, URING_FS_PREBUILD_ONLY: '1' },
+            encoding: 'utf8',
+          }
+        );
+        assert.equal(prebuildOnlyRes.status, 0);
+        assert.match(prebuildOnlyRes.stdout, /SUPPORTED: (true|false)/);
+      }
+
+      // C. Static liburing.a & ELF dynamic symbol hiding (0 exported io_uring_* symbols)
+      if (fs.existsSync(buildPath)) {
+        const nmRes = spawnSync('nm', ['-D', buildPath], { encoding: 'utf8' });
+        if (nmRes.status === 0) {
+          const leakedUringSymbols = nmRes.stdout
+            .split('\n')
+            .filter((line) => line.includes('io_uring_'));
+          assert.equal(
+            leakedUringSymbols.length,
+            0,
+            `Expected 0 exported io_uring_* symbols in .dynsym, found: ${leakedUringSymbols.join(', ')}`
+          );
+        }
+      }
+    }
+  });
 });

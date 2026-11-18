@@ -51,6 +51,7 @@ export const {
   W_OK,
   X_OK,
   COPYFILE_EXCL,
+  detectLibc,
 } = cjsModule;
 
 export default cjsModule;

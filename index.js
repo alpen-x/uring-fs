@@ -6,13 +6,72 @@ const pathModule = require('node:path');
 const { fileURLToPath } = require('node:url');
 const { DedicatedWorkerPool } = require('./lib/worker_fallback');
 
+/**
+ * Detects the C standard library variant on Linux ('glibc' or 'musl').
+ * Returns null on non-Linux operating systems.
+ */
+function detectLibc() {
+  if (process.platform !== 'linux') {
+    return null;
+  }
+  try {
+    if (typeof process.report?.getReport === 'function') {
+      const rep = process.report.getReport();
+      if (rep && rep.header && rep.header.glibcVersionRuntime) {
+        return 'glibc';
+      }
+      if (rep && Array.isArray(rep.sharedObjects)) {
+        if (rep.sharedObjects.some((s) => typeof s === 'string' && s.includes('musl'))) {
+          return 'musl';
+        }
+      }
+    }
+  } catch {}
+
+  const fs = require('node:fs');
+  try {
+    if (
+      fs.existsSync('/lib/ld-musl-x86_64.so.1') ||
+      fs.existsSync('/lib/ld-musl-aarch64.so.1') ||
+      fs.existsSync('/etc/alpine-release')
+    ) {
+      return 'musl';
+    }
+  } catch {}
+
+  return 'glibc';
+}
+
 let native = null;
 let loadError = null;
 
-try {
-  native = require('./build/Release/uring_fs.node');
-} catch (err) {
-  loadError = err;
+const candidates = [];
+if (process.env.URING_FS_PREBUILD_ONLY !== '1') {
+  candidates.push(pathModule.join(__dirname, 'build', 'Release', 'uring_fs.node'));
+}
+
+if (process.platform === 'linux' && process.env.URING_FS_IGNORE_PREBUILDS !== '1') {
+  const libc = detectLibc();
+  if (libc) {
+    candidates.push(pathModule.join(__dirname, 'prebuilds', `linux-${process.arch}`, `uring_fs.${libc}.node`));
+    candidates.push(`@alpenx/uring-fs-linux-${process.arch}-${libc}`);
+    candidates.push(`@uring-fs/linux-${process.arch}-${libc}`);
+  }
+  candidates.push(pathModule.join(__dirname, 'prebuilds', `linux-${process.arch}`, 'uring_fs.node'));
+  candidates.push(`@alpenx/uring-fs-linux-${process.arch}`);
+  candidates.push(`@uring-fs/linux-${process.arch}`);
+}
+
+for (const candidate of candidates) {
+  try {
+    native = require(candidate);
+    loadError = null;
+    break;
+  } catch (err) {
+    if (!loadError) {
+      loadError = err;
+    }
+  }
 }
 
 const config = {
@@ -2459,6 +2518,7 @@ module.exports = {
   closeFallbackWorkers,
   UringStats,
   constants,
+  detectLibc,
   F_OK: fsConstants.F_OK,
   R_OK: fsConstants.R_OK,
   W_OK: fsConstants.W_OK,

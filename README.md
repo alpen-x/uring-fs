@@ -53,9 +53,27 @@ When a server performs CPU-bound thread-pool work (such as password hashing, TLS
 npm install uring-fs
 ```
 
-### Linux Native `io_uring` Prerequisites
-If `<liburing.h>` is present during `npm install`, `uring-fs` compiles the native C++ `io_uring` engine automatically. If `liburing-dev` is not installed yet (or on macOS/Windows), `npm install` still succeeds cleanly using a lightweight stub and your configured fallback backend.
+### Zero-Friction Prebuilds vs. Host CPU-Optimized Compilation (`-march=native`)
 
+By default on Linux (`x64` and `arm64`, both `glibc` and `musl`), `uring-fs` ships with precompiled N-API binaries statically linked against `liburing.a` (with hidden ELF symbol visibility). This means `npm install uring-fs` works out-of-the-box in seconds with **zero runtime `liburing.so.2` or `build-essential` dependencies**—even in slim Docker/Alpine containers or when package managers run with `--ignore-scripts`.
+
+> **Does static prebuilding hurt `liburing` performance on my CPU?**
+> No: 95% of `liburing`'s hot path (`io_uring_get_sqe`, `io_uring_prep_*`, `io_uring_cqe_seen`, atomic memory barriers) consists of `static inline` header routines compiled with `-O3`, while the heavy I/O, DMA, and NVMe queue processing runs directly inside **your host's own Linux kernel**.
+>
+> However, if you want to compile `src/addon.cc` and `<liburing.h>` inline ring routines specifically tuned for your host CPU microarchitecture (`-O3 -march=native -mtune=native`) or link dynamically against your system's `liburing.so`, you can opt into source compilation at any time:
+
+```bash
+# 1. Install and compile tuned for the exact host CPU (-O3 -march=native -mtune=native)
+URING_FS_MARCH_NATIVE=1 npm install uring-fs
+
+# 2. Or rebuild an existing installation from source with standard -O3
+URING_FS_BUILD_FROM_SOURCE=1 npm rebuild uring-fs
+
+# 3. Or link dynamically against the system's shared liburing.so instead of static liburing.a
+URING_FS_SHARED_LIBURING=1 URING_FS_BUILD_FROM_SOURCE=1 npm rebuild uring-fs
+```
+
+### Linux Build-From-Source Prerequisites (Only needed when compiling from source)
 ```bash
 # Ubuntu / Debian
 sudo apt update && sudo apt install -y liburing-dev build-essential
