@@ -5,6 +5,19 @@ All notable changes to `uring-fs` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.2] - 2026-11-17
+
+### Added
+- **Zero-Friction Prebuilds & Runtime Loader (`linux-x64` & `linux-arm64`, `glibc` & `musl`):**
+  - Precompiled N-API binaries for `linux-x64` and `linux-arm64` across both `glibc` and `musl` (Alpine), plus runtime fallback resolution in `index.js` (`prebuilds/linux-${arch}/uring_fs.${libc}.node` and optional platform packages) so `uring-fs` works out-of-the-box even when installed with `--ignore-scripts`.
+  - Added `scripts/install.js` fast-path loader and `scripts/prebuild.js` builder, plus a 4-target build matrix (`ubuntu-24.04`, `ubuntu-24.04-arm`, and `alpine:3.20`) in `.github/workflows/publish.yml`.
+  - Exported `detectLibc()` utility to detect `'glibc'`, `'musl'`, or `null` at runtime.
+- **Static `liburing.a` Linking with Hidden ELF Symbol Visibility (`binding.gyp`):**
+  - Automatically links `liburing.a` statically on Linux (`-Wl,-Bstatic -luring -Wl,-Bdynamic`), eliminating the runtime dependency on `liburing.so.2`.
+  - Added `-fvisibility=hidden` and `-Wl,--exclude-libs,ALL` so zero `io_uring_*` symbols leak into the addon's dynamic symbol table (`.dynsym`).
+- **Host CPU-Optimized Source Compilation (`-march=native`):**
+  - Added `URING_FS_MARCH_NATIVE=1` (`npm run build:native`) to compile `src/addon.cc` and inlined `<liburing.h>` ring primitives with `-O3 -march=native -mtune=native` for the exact host CPU microarchitecture, plus `URING_FS_SHARED_LIBURING=1` to opt into dynamic `liburing.so` linking.
+
 ## [1.3.1] - 2026-11-09
 
 ### Fixed

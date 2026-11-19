@@ -426,6 +426,7 @@ export function configure(options?: UringFsConfig): {
 };
 export function setOptimisticReadSize(bytes: number): number;
 export function closeFallbackWorkers(): Promise<void>;
+export function detectLibc(): 'glibc' | 'musl' | null;
 export function readBatchAt(
   path: PathLike,
   ranges: BatchSliceRange[],
@@ -559,6 +560,7 @@ declare const _default: {
   closeFallbackWorkers: typeof closeFallbackWorkers;
   UringStats: typeof UringStats;
   constants: typeof constants;
+  detectLibc: typeof detectLibc;
   F_OK: typeof F_OK;
   R_OK: typeof R_OK;
   W_OK: typeof W_OK;

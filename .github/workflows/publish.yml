@@ -14,8 +14,71 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  build-prebuilds:
+    name: Prebuild ${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.libc }}
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            arch: x64
+            libc: glibc
+            os: ubuntu-24.04
+            container: null
+          - platform: linux
+            arch: arm64
+            libc: glibc
+            os: ubuntu-24.04-arm
+            container: null
+          - platform: linux
+            arch: x64
+            libc: musl
+            os: ubuntu-24.04
+            container: 'alpine:3.20'
+          - platform: linux
+            arch: arm64
+            libc: musl
+            os: ubuntu-24.04-arm
+            container: 'alpine:3.20'
+    steps:
+      - name: Install dependencies (Alpine / musl)
+        if: matrix.libc == 'musl'
+        run: |
+          apk add --no-cache nodejs npm python3 make g++ liburing-dev liburing-static linux-headers git
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install dependencies (Ubuntu / glibc)
+        if: matrix.libc == 'glibc'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev build-essential python3
+
+      - name: Setup Node.js (Ubuntu / glibc)
+        if: matrix.libc == 'glibc'
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24.x'
+
+      - name: Install npm dependencies
+        run: npm install --ignore-scripts
+
+      - name: Build prebuilt binary
+        run: npm run prebuild
+
+      - name: Upload prebuild artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.libc }}
+          path: prebuilds/
+          retention-days: 1
+
   publish:
     name: Build, Verify & Publish to npm
+    needs: build-prebuilds
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
@@ -35,6 +98,16 @@ jobs:
 
       - name: Upgrade npm for OIDC Trusted Publishing support
         run: npm install -g npm@latest
+
+      - name: Download all prebuild artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: prebuild-*
+          path: prebuilds
+          merge-multiple: true
+
+      - name: Verify prebuilt binaries
+        run: ls -laR prebuilds/
 
       - name: Install dependencies and build native addon
         run: npm install
