@@ -8,6 +8,9 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -37,8 +40,14 @@ jobs:
       - name: Install dependencies and build native addon
         run: npm install
 
-      - name: Run test suite
-        run: npm test
+      - name: Run static linter & C++ -Werror check
+        run: npm run lint
+
+      - name: Verify kernel io_uring backend is active
+        run: node -e "if (!require('.').isUringSupported()) { console.error('Expected io_uring to be supported'); process.exit(1); }"
+
+      - name: Run test suite with coverage gate
+        run: npm run test:coverage
 
   fallback-stub:
     name: Fallback Stub (${{ matrix.os }}, Node 24.x)
@@ -66,6 +75,9 @@ jobs:
 
       - name: Install dependencies and build stub addon
         run: npm install
+
+      - name: Run static linter
+        run: npm run lint
 
       - name: Run test suite in fallback mode
         run: npm test

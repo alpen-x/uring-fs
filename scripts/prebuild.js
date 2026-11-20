@@ -16,7 +16,7 @@ if (shouldRebuild) {
   const res = spawnSync('node-gyp', ['rebuild'], {
     cwd: rootDir,
     stdio: 'inherit',
-    shell: true,
+    shell: process.platform === 'win32',
   });
   if (res.status !== 0) {
     console.error(`[uring-fs] Compilation failed with status ${res.status}`);
@@ -29,7 +29,7 @@ if (!fs.existsSync(builtAddonPath)) {
   process.exit(1);
 }
 
-const libc = detectLibc() || 'gnu';
+const libc = detectLibc() || 'glibc';
 const targetDir = path.join(rootDir, 'prebuilds', `${process.platform}-${process.arch}`);
 const targetPath = path.join(targetDir, `uring_fs.${libc}.node`);
 

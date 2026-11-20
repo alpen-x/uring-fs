@@ -41,10 +41,20 @@ if (!buildFromSource && process.platform === 'linux' && process.env.URING_FS_IGN
 
 // Fallback to building from source via node-gyp
 try {
-  const res = spawnSync('node-gyp', ['rebuild'], {
+  let gypCmd = 'node-gyp';
+  let gypArgs = ['rebuild'];
+  try {
+    const localGyp = process.env.npm_config_node_gyp || require.resolve('node-gyp/bin/node-gyp.js');
+    if (localGyp && fs.existsSync(localGyp)) {
+      gypCmd = process.execPath;
+      gypArgs = [localGyp, 'rebuild'];
+    }
+  } catch {}
+
+  const res = spawnSync(gypCmd, gypArgs, {
     cwd: rootDir,
     stdio: 'inherit',
-    shell: true,
+    shell: gypCmd === 'node-gyp' && process.platform === 'win32',
   });
 
   if (res.status !== 0) {

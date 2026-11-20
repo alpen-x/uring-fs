@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+set -e
+echo "[git pre-push] Running full quality gate (lint + coverage + fallback backends)..."
+npm run check

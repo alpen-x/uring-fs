@@ -27,10 +27,15 @@
   ],
   "scripts": {
     "install": "node scripts/install.js",
+    "prepare": "node -e \"if(require('fs').existsSync('scripts/setup-hooks.js'))require('./scripts/setup-hooks.js')\"",
     "build": "node-gyp rebuild",
     "build:native": "URING_FS_MARCH_NATIVE=1 node-gyp rebuild",
     "prebuild": "node scripts/prebuild.js --rebuild",
+    "lint": "node scripts/lint.js",
     "test": "node --test test/suite.test.js",
+    "test:coverage": "node --test --experimental-test-coverage --test-coverage-lines=90 test/suite.test.js",
+    "test:fallback": "URING_FS_DISABLE_NATIVE=1 node --test test/suite.test.js && URING_FS_DISABLE_NATIVE=stub node --test test/suite.test.js",
+    "check": "npm run lint && npm run test:coverage && npm run test:fallback",
     "benchmark": "node benchmark.js",
     "benchmark:starvation": "node starvation_test.js"
   },
