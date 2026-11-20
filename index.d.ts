@@ -90,15 +90,15 @@ export class UringFileHandle {
 
   read<T extends NodeJS.ArrayBufferView>(
     buffer?: T,
-    offset?: number,
-    length?: number,
+    offset?: number | null,
+    length?: number | null,
     position?: number | null
   ): Promise<ReadHandleResult<T>>;
   read<T extends NodeJS.ArrayBufferView = Buffer>(
     options?: {
       buffer?: T;
-      offset?: number;
-      length?: number;
+      offset?: number | null;
+      length?: number | null;
       position?: number | null;
     }
   ): Promise<ReadHandleResult<T>>;
@@ -134,8 +134,8 @@ export class UringFileHandle {
 
   write<T extends NodeJS.ArrayBufferView>(
     buffer: T,
-    offset?: number,
-    length?: number,
+    offset?: number | null,
+    length?: number | null,
     position?: number | null
   ): Promise<WriteHandleResult<T>>;
   write(
@@ -397,11 +397,15 @@ export function rename(
   options?: UringCommonOptions
 ): Promise<void>;
 
+export interface UringSymlinkOptions extends UringCommonOptions {
+  type?: 'dir' | 'file' | 'junction' | string | null;
+}
+
 export function symlink(
   target: PathLike,
   path: PathLike,
-  type?: string | null | UringCommonOptions,
-  options?: UringCommonOptions
+  type?: 'dir' | 'file' | 'junction' | string | null | UringSymlinkOptions,
+  options?: UringSymlinkOptions
 ): Promise<void>;
 
 export function link(
@@ -469,7 +473,7 @@ export function fadvise(
   path: PathLike,
   offset: number,
   length: number,
-  advice: number,
+  advice?: number | UringFadviseOptions,
   options?: UringFadviseOptions
 ): Promise<void>;
 

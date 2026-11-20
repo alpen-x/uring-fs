@@ -4,7 +4,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
-const { detectLibc } = require('../index.js');
+const { detectLibc } = require('../lib/libc');
 
 const rootDir = path.resolve(__dirname, '..');
 const builtAddonPath = path.join(rootDir, 'build', 'Release', 'uring_fs.node');
