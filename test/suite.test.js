@@ -23,6 +23,10 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     if (tmpDir) {
       await fsPromises.rm(tmpDir, { recursive: true, force: true });
     }
+    const finalStats = uringFs.getRingStats();
+    assert.equal(finalStats.activeRequests, 0, 'Expected 0 activeRequests at test suite end');
+    assert.equal(finalStats.inFlightSqes, 0, 'Expected 0 inFlightSqes at test suite end');
+    assert.equal(finalStats.directFdsInUse, 0, 'Expected 0 directFdsInUse at test suite end');
   });
 
   test('1. Linux Kernel io_uring support and Direct FD table detection', () => {
@@ -2075,5 +2079,902 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
         }
       }
     }
+  });
+
+  test('24. Modular JS layers (lib/libc.js, lib/validators.js, lib/stats.js, lib/worker_script.js) and install side-effect isolation', async () => {
+    const { spawnSync } = require('node:child_process');
+    const { detectLibc } = require('../lib/libc');
+    const { UringStats } = require('../lib/stats');
+    const validators = require('../lib/validators');
+
+    // A. lib/libc.js works standalone and scripts/install.js does not require('../index.js')
+    assert.equal(detectLibc(), uringFs.detectLibc());
+    const installSrc = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'install.js'), 'utf8');
+    assert.ok(!installSrc.includes("require('../index.js')"), 'scripts/install.js must not load index.js');
+    assert.ok(installSrc.includes("require('../lib/libc')"), 'scripts/install.js must import lib/libc');
+
+    // Verify in a fresh process that requiring lib/libc.js does not load index.js or .node addon
+    const isolationCheck = spawnSync(
+      process.execPath,
+      [
+        '-e',
+        'const { detectLibc } = require("./lib/libc"); detectLibc(); const loaded = Object.keys(require.cache); console.log(JSON.stringify(loaded));',
+      ],
+      { cwd: path.join(__dirname, '..'), encoding: 'utf8' }
+    );
+    assert.equal(isolationCheck.status, 0);
+    const cachedFiles = JSON.parse(isolationCheck.stdout.trim());
+    assert.ok(
+      !cachedFiles.some((f) => f.endsWith(`${path.sep}index.js`) || f.endsWith('.node')),
+      `Requiring lib/libc.js must not load index.js or native .node addon: ${cachedFiles.join(', ')}`
+    );
+
+    // B. lib/validators.js unit coverage
+    assert.equal(validators.normalizePath('/tmp/abc'), '/tmp/abc');
+    assert.equal(validators.normalizePath(Buffer.from('/tmp/buf')), '/tmp/buf');
+    assert.equal(validators.normalizePath(new URL('file:///tmp/url')), '/tmp/url');
+    assert.throws(() => validators.normalizePath(123), { code: 'ERR_INVALID_ARG_TYPE' });
+
+    assert.doesNotThrow(() => validators.validateEncoding('utf8'));
+    assert.doesNotThrow(() => validators.validateEncoding(null));
+    assert.throws(() => validators.validateEncoding('invalid-enc'), { code: 'ERR_INVALID_ARG_VALUE' });
+
+    assert.equal(validators.parseOpenFlags('r'), fs.constants.O_RDONLY);
+    assert.equal(validators.parseWriteFlags('w'), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC);
+    assert.throws(() => validators.parseWriteFlags('badflag'), { code: 'ERR_INVALID_OPT_VALUE' });
+
+    const enoentErr = validators.createErrnoError('ENOENT', 'open', '/missing');
+    assert.equal(enoentErr.code, 'ENOENT');
+    assert.equal(enoentErr.errno, -2);
+    assert.equal(enoentErr.path, '/missing');
+
+    const abortErr = validators.createAbortError({ reason: 'stopped' });
+    assert.equal(abortErr.code, 'ABORT_ERR');
+    assert.equal(abortErr.cause, 'stopped');
+
+    const wrappedOk = await validators.wrapWithAbortSignal(Promise.resolve(42), null);
+    assert.equal(wrappedOk, 42);
+    await assert.rejects(
+      () => validators.wrapWithAbortSignal(new Promise(() => {}), AbortSignal.abort()),
+      { code: 'ABORT_ERR' }
+    );
+
+    assert.deepEqual(validators.parseBatchRanges([[0, 5], { offset: 10, length: 2 }]), [
+      { offset: 0, length: 5 },
+      { offset: 10, length: 2 },
+    ]);
+    assert.throws(() => validators.parseBatchRanges('nope'), { code: 'ERR_INVALID_ARG_TYPE' });
+    assert.throws(() => validators.parseBatchRanges([[-1, 5]]), { code: 'ERR_OUT_OF_RANGE' });
+
+    // C. lib/stats.js export parity
+    assert.equal(UringStats, uringFs.UringStats);
+
+    // D. lib/worker_script.js file exists and worker_fallback.js does not use { eval: true }
+    const workerScriptPath = path.join(__dirname, '..', 'lib', 'worker_script.js');
+    assert.ok(fs.existsSync(workerScriptPath), 'lib/worker_script.js must exist');
+    const workerFallbackSrc = fs.readFileSync(path.join(__dirname, '..', 'lib', 'worker_fallback.js'), 'utf8');
+    assert.ok(!workerFallbackSrc.includes('eval: true'), 'lib/worker_fallback.js must not use { eval: true }');
+
+    // E. Worker writeFile honors options.flush
+    const workerFlushFile = path.join(tmpDir, 'worker_flush_test.txt');
+    await uringFs.writeFile(workerFlushFile, 'flushed-via-worker', { fallback: 'worker', flush: true });
+    const workerFlushRead = await uringFs.readFile(workerFlushFile, { fallback: 'worker', encoding: 'utf8' });
+    assert.equal(workerFlushRead, 'flushed-via-worker');
+    await uringFs.closeFallbackWorkers();
+  });
+
+  test('25. DedicatedWorkerPool.resize(), parallel fh.readBatchAt, and ArrayBufferView vectored I/O', async () => {
+    const { DedicatedWorkerPool } = require('../lib/worker_fallback');
+
+    // A. DedicatedWorkerPool.resize() grow, shrink idle, shrink busy, and configure({ workerPoolSize })
+    const poolTestFile = path.join(tmpDir, 'pool_resize_test.txt');
+    await uringFs.writeFile(poolTestFile, 'resize-payload');
+
+    const pool = new DedicatedWorkerPool(2);
+    try {
+      assert.equal(await pool.exec('readFile', [poolTestFile, 'utf8'], 'utf8'), 'resize-payload');
+      assert.equal(pool.workers.length, 2);
+
+      // Grow from 2 to 4
+      await pool.resize(4);
+      assert.equal(pool.poolSize, 4);
+      assert.equal(pool.workers.length, 4);
+
+      // Shrink from 4 to 1 while busy
+      const busyReads = [];
+      for (let i = 0; i < 8; i++) {
+        busyReads.push(pool.exec('readFile', [poolTestFile, 'utf8'], 'utf8'));
+      }
+      const resizePromise = pool.resize(1);
+      assert.equal(pool.poolSize, 1);
+      assert.equal(pool.workers.length, 1);
+
+      const results = await Promise.all(busyReads);
+      assert.equal(results.length, 8);
+      for (const r of results) {
+        assert.equal(r, 'resize-payload');
+      }
+      await resizePromise;
+
+      // Invalid resize values throw RangeError
+      assert.throws(() => pool.resize(0), { code: 'ERR_OUT_OF_RANGE' });
+      assert.throws(() => pool.resize(NaN), { code: 'ERR_OUT_OF_RANGE' });
+    } finally {
+      await pool.terminate();
+    }
+
+    // configure({ workerPoolSize }) invokes pool.resize()
+    try {
+      uringFs.configure({ workerPoolSize: 3 });
+      assert.equal(await uringFs.readFile(poolTestFile, { fallback: 'worker', encoding: 'utf8' }), 'resize-payload');
+      const cfg = uringFs.configure({ workerPoolSize: 1 });
+      assert.equal(cfg.workerPoolSize, 1);
+      assert.equal(await uringFs.readFile(poolTestFile, { fallback: 'worker', encoding: 'utf8' }), 'resize-payload');
+    } finally {
+      uringFs.configure({ workerPoolSize: 2 });
+      await uringFs.closeFallbackWorkers();
+    }
+
+    // B. Parallel UringFileHandle.prototype.readBatchAt batches SQEs into 1 submit syscall
+    const batchFhFile = path.join(tmpDir, 'fh_parallel_batch.bin');
+    const payload = Buffer.from('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ');
+    await uringFs.writeFile(batchFhFile, payload);
+
+    const fh = await uringFs.open(batchFhFile, 'r');
+    try {
+      const ranges = [
+        [0, 5],
+        [5, 5],
+        [10, 6],
+        { offset: 16, length: 10 },
+        { offset: 26, length: 10 },
+      ];
+      const before = uringFs.getRingStats();
+      const slices = await fh.readBatchAt(ranges);
+      const after = uringFs.getRingStats();
+
+      assert.deepEqual(slices.map((b) => b.toString('utf8')), [
+        '01234',
+        '56789',
+        'ABCDEF',
+        'GHIJKLMNOP',
+        'QRSTUVWXYZ',
+      ]);
+
+      if (uringFs.isUringSupported()) {
+        const submits = after.totalSubmitSyscalls - before.totalSubmitSyscalls;
+        const prepared = after.totalSqesPrepared - before.totalSqesPrepared;
+        assert.equal(prepared, 5, `Expected 5 prepared SQEs, got ${prepared}`);
+        assert.equal(submits, 1, `Expected all 5 fh.readBatchAt SQEs in 1 submit syscall, got ${submits}`);
+      }
+    } finally {
+      await fh.close();
+    }
+
+    // Worker fallback fh.readBatchAt
+    const workerFh = await uringFs.open(batchFhFile, 'r', { fallback: 'worker' });
+    try {
+      const wSlices = await workerFh.readBatchAt([[0, 5], [10, 3]], 'utf8');
+      assert.deepEqual(wSlices, ['01234', 'ABC']);
+    } finally {
+      await workerFh.close();
+    }
+
+    // C. ArrayBufferView (Uint16Array & DataView) in writev, readv, fh.writev, fh.readv
+    const abvFile = path.join(tmpDir, 'abv_vectored.bin');
+    const u16Write = new Uint16Array([0x4241, 0x4443]); // 'ABCD' on little-endian
+    const dvRaw = new ArrayBuffer(8);
+    const dvWrite = new DataView(dvRaw, 2, 4);
+    dvWrite.setUint8(0, 69); // 'E'
+    dvWrite.setUint8(1, 70); // 'F'
+    dvWrite.setUint8(2, 71); // 'G'
+    dvWrite.setUint8(3, 72); // 'H'
+
+    const wvRes = await uringFs.writev(abvFile, [u16Write, dvWrite], 0);
+    assert.equal(wvRes.bytesWritten, 8);
+
+    const u16Read = new Uint16Array(2);
+    const dvRead = new DataView(new ArrayBuffer(4));
+    const rvRes = await uringFs.readv(abvFile, [u16Read, dvRead], 0);
+    assert.equal(rvRes.bytesRead, 8);
+    assert.deepEqual(u16Read, u16Write);
+    assert.equal(dvRead.getUint8(0), 69);
+    assert.equal(dvRead.getUint8(3), 72);
+
+    const abvFh = await uringFs.open(abvFile, 'r+');
+    try {
+      const u16FhWrite = new Uint16Array([0x5a59]); // 'YZ'
+      const fhWv = await abvFh.writev([u16FhWrite], 0);
+      assert.equal(fhWv.bytesWritten, 2);
+
+      const dvFhRead = new DataView(new ArrayBuffer(4));
+      const fhRv = await abvFh.readv([dvFhRead], 0);
+      assert.equal(fhRv.bytesRead, 4);
+      assert.equal(Buffer.from(dvFhRead.buffer).subarray(0, 2).toString('utf8'), 'YZ');
+    } finally {
+      await abvFh.close();
+    }
+  });
+
+  test('26. Core modularization, DataView/Uint16Array fh.read/write, empty readBatchAt encoding check, worker DataCloneError cleanup, and npm pack check', async () => {
+    const { spawnSync } = require('node:child_process');
+    const { DedicatedWorkerPool } = require('../lib/worker_fallback');
+
+    // A & B. fh.read and fh.write with DataView and Uint16Array (io_uring + fs fallback) + empty readBatchAt encoding check
+    const abvHandleFile = path.join(tmpDir, 'fh_abv_rw.bin');
+    for (const opts of [{}, { fallback: 'fs' }]) {
+      const fh = await uringFs.open(abvHandleFile, 'w+', 0o666, opts);
+      try {
+        const u16In = new Uint16Array([0x4241, 0x4443]); // 'ABCD'
+        const w1 = await fh.write(u16In, 0, 4, 0);
+        assert.equal(w1.bytesWritten, 4);
+        assert.equal(w1.buffer, u16In);
+
+        const dvInBuf = new ArrayBuffer(8);
+        const dvIn = new DataView(dvInBuf, 2, 4);
+        dvIn.setUint8(0, 69); // 'E'
+        dvIn.setUint8(1, 70); // 'F'
+        dvIn.setUint8(2, 71); // 'G'
+        dvIn.setUint8(3, 72); // 'H'
+        const w2 = await fh.write(dvIn, 0, 4, 4);
+        assert.equal(w2.bytesWritten, 4);
+        assert.equal(w2.buffer, dvIn);
+
+        const u16Out = new Uint16Array(2);
+        const r1 = await fh.read(u16Out, 0, 4, 0);
+        assert.equal(r1.bytesRead, 4);
+        assert.equal(r1.buffer, u16Out);
+        assert.deepEqual(u16Out, u16In);
+
+        const dvOutBuf = new ArrayBuffer(8);
+        const dvOut = new DataView(dvOutBuf, 2, 4);
+        const r2 = await fh.read(dvOut, 0, 4, 4);
+        assert.equal(r2.bytesRead, 4);
+        assert.equal(r2.buffer, dvOut);
+        assert.equal(Buffer.from(dvOut.buffer, dvOut.byteOffset, dvOut.byteLength).toString('utf8'), 'EFGH');
+
+        await assert.rejects(
+          () => fh.readBatchAt([], 'invalid-encoding'),
+          (err) => err instanceof TypeError && err.code === 'ERR_INVALID_ARG_VALUE'
+        );
+      } finally {
+        await fh.close();
+      }
+    }
+
+    // D. DedicatedWorkerPool.exec() handles DataCloneError without leaking activeCount or pending
+    const pool = new DedicatedWorkerPool(1);
+    try {
+      await assert.rejects(
+        () => pool.exec('writeFile', [path.join(tmpDir, 'uncloneable.txt'), () => {}]),
+        (err) => err && (err.name === 'DataCloneError' || /could not be cloned/i.test(err.message))
+      );
+      assert.equal(pool.pending.size, 0);
+      assert.equal(pool.workers[0].activeCount, 0);
+
+      // Pool remains healthy for subsequent operations
+      const okFile = path.join(tmpDir, 'after_dataclone.txt');
+      await pool.exec('writeFile', [okFile, 'still-alive', { encoding: 'utf8' }]);
+      assert.equal(await pool.exec('readFile', [okFile, 'utf8'], 'utf8'), 'still-alive');
+    } finally {
+      await pool.terminate();
+    }
+
+    // E. Verify all modular lib/*.js files appear in npm pack --dry-run
+    const packRes = spawnSync('npm', ['pack', '--dry-run'], {
+      cwd: path.join(__dirname, '..'),
+      encoding: 'utf8',
+    });
+    assert.equal(packRes.status, 0);
+    const packOutput = `${packRes.stdout}\n${packRes.stderr}`;
+    const expectedFiles = [
+      'src/addon.cc',
+      'src/addon_stub.cc',
+      'index.js',
+      'lib/libc.js',
+      'lib/constants.js',
+      'lib/stats.js',
+      'lib/validators.js',
+      'lib/worker_fallback.js',
+      'lib/worker_script.js',
+      'lib/backend.js',
+      'lib/file_handle.js',
+      'lib/ops_read.js',
+      'lib/ops_write.js',
+      'lib/ops_meta.js',
+    ];
+    for (const rel of expectedFiles) {
+      assert.ok(packOutput.includes(rel), `Expected ${rel} in npm pack --dry-run output`);
+    }
+  });
+
+  test('27. Round 2 DRY & KISS edge cases: mkdir dangling symlink ENOENT parity, fh.readv 0-byte dir EISDIR, TypedArray writeFile, and open() direct-slot accounting', async () => {
+    // A. mkdir(danglingSymlink, { recursive: true }) throws ENOENT (matching node:fs/promises across all backends)
+    const danglingTarget = path.join(tmpDir, 'does_not_exist_target');
+    const danglingLink = path.join(tmpDir, 'dangling_symlink_dir');
+    await uringFs.symlink(danglingTarget, danglingLink);
+    await assert.rejects(
+      () => uringFs.mkdir(danglingLink, { recursive: true }),
+      (err) => err && (err.code === 'ENOENT' || err.code === 'EEXIST')
+    );
+    const nestedUnderDangling = path.join(danglingLink, 'nested');
+    await assert.rejects(
+      () => uringFs.mkdir(nestedUnderDangling, { recursive: true }),
+      (err) => err && (err.code === 'ENOENT' || err.code === 'ENOTDIR' || err.code === 'EEXIST')
+    );
+
+    // B. fh.readv([Buffer.alloc(0)], 0) on a directory throws EISDIR across backends
+    for (const b of ['default', 'worker', 'fs']) {
+      const opts = b === 'default' ? {} : { fallback: b };
+      const dirFh = await uringFs.open(tmpDir, 'r', opts);
+      try {
+        await assert.rejects(
+          () => dirFh.readv([Buffer.alloc(0)], 0),
+          { code: 'EISDIR' },
+          `fh.readv([Buffer.alloc(0)], 0) on directory with ${b} must throw EISDIR`
+        );
+      } finally {
+        await dirFh.close();
+      }
+    }
+
+    // C. writeFile passes TypedArrays / DataViews directly to native without redundant Buffer.from copy
+    const taFile = path.join(tmpDir, 'typed_array_direct.bin');
+    const u16 = new Uint16Array([0x4142, 0x4344]);
+    await uringFs.writeFile(taFile, u16);
+    const readBack = await uringFs.readFile(taFile);
+    assert.deepEqual(readBack, Buffer.from(u16.buffer, u16.byteOffset, u16.byteLength));
+
+    const dv = new DataView(new ArrayBuffer(6), 1, 4);
+    dv.setUint32(0, 0x55667788, false);
+    await uringFs.writeFile(taFile, dv);
+    assert.deepEqual(await uringFs.readFile(taFile), Buffer.from([0x55, 0x66, 0x77, 0x88]));
+
+    // D. open() direct-slot accounting
+    const statsBefore = uringFs.getRingStats();
+    const credFile = path.join(tmpDir, 'open_cred_check.txt');
+    await uringFs.writeFile(credFile, 'cred-ok');
+
+    const fh = await uringFs.open(credFile, 'r');
+    try {
+      if (statsBefore.directFdsSupported) {
+        assert.ok(fh.directSlot >= 0);
+        assert.equal(uringFs.getRingStats().directFdsInUse, statsBefore.directFdsInUse + 1);
+      }
+      assert.equal(await fh.readAt(0, 7, 'utf8'), 'cred-ok');
+    } finally {
+      await fh.close();
+    }
+    assert.equal(uringFs.getRingStats().directFdsInUse, statsBefore.directFdsInUse);
+  });
+
+  test('29. Comprehensive JS Line & Branch Coverage across lib/*.js modules', async () => {
+    const validators = require('../lib/validators');
+    const { UringFileHandle } = require('../lib/file_handle');
+    const { DedicatedWorkerPool } = require('../lib/worker_fallback');
+    const { detectLibc } = require('../lib/libc');
+    const backendMod = require('../lib/backend');
+
+    // A. lib/validators.js uncovered branches
+    const dvSample = new DataView(new ArrayBuffer(6), 1, 4);
+    dvSample.setUint32(0, 0x41424344, false);
+    const dvView = validators.toByteView(dvSample);
+    assert.ok(Buffer.isBuffer(dvView));
+    assert.equal(dvView.toString('utf8'), 'ABCD');
+    assert.equal(validators.parseWriteFlags(fs.constants.O_WRONLY | fs.constants.O_CREAT), fs.constants.O_WRONLY | fs.constants.O_CREAT);
+
+    // attachCallerStack fallback when callerFn is not in async/sync stack
+    const dummyErr = new Error('stackless');
+    dummyErr.stack = 'Error: stackless';
+    function notInStack() {}
+    validators.attachCallerStack(dummyErr, notInStack);
+    assert.match(dummyErr.stack, /\n\s+at /);
+
+    const acOk = new AbortController();
+    assert.equal(await validators.wrapWithAbortSignal(Promise.resolve('ok'), acOk.signal), 'ok');
+    const acErr = new AbortController();
+    await assert.rejects(() => validators.wrapWithAbortSignal(Promise.reject(new Error('fail-fast')), acErr.signal), /fail-fast/);
+    const acMid = new AbortController();
+    const midPromise = validators.wrapWithAbortSignal(new Promise(() => {}), acMid.signal);
+    acMid.abort('cancelled-mid');
+    await assert.rejects(() => midPromise, (e) => e.code === 'ABORT_ERR' && e.cause === 'cancelled-mid');
+
+    // B. lib/ops_write.js uncovered branches
+    const hexFile = path.join(tmpDir, 'cov_hex_write.bin');
+    await uringFs.writeFile(hexFile, '48656c6c6f', 'hex');
+    assert.equal(await uringFs.readFile(hexFile, 'utf8'), 'Hello');
+
+    const customNoVecWriteFile = path.join(tmpDir, 'cov_custom_writev.bin');
+    let customSynced = false;
+    const customStreamProvider = {
+      readFile: fsPromises.readFile,
+      async open(p, flags, mode) {
+        const fh = await fsPromises.open(p, flags, mode);
+        return {
+          read: (b, o, l, pos) => fh.read(b, o, l, pos),
+          write: (b, o, l, pos) => fh.write(b, o, l, pos),
+          sync: async () => { customSynced = true; await fh.sync(); },
+          stat: () => fh.stat(),
+          close: () => fh.close(),
+        };
+      },
+    };
+    const wvCust = await uringFs.writev(customNoVecWriteFile, [Buffer.from('AA'), Buffer.from('BB')], 0, {
+      fallback: customStreamProvider,
+      flush: true,
+    });
+    assert.equal(wvCust.bytesWritten, 4);
+    assert.equal(customSynced, true);
+    assert.equal(fs.readFileSync(customNoVecWriteFile, 'utf8'), 'AABB');
+
+    const fallocNullFile = path.join(tmpDir, 'cov_falloc_null.bin');
+    await uringFs.fallocate(fallocNullFile, 0, 16, null);
+    assert.equal(fs.statSync(fallocNullFile).size, 16);
+
+    const customDirFallocProvider = {
+      readFile: fsPromises.readFile,
+      async open() {
+        return {
+          stat: async () => ({ isDirectory: () => true, size: 0 }),
+          truncate: async () => {},
+          close: async () => {},
+        };
+      },
+    };
+    await assert.rejects(
+      () => uringFs.fallocate(tmpDir, 0, 16, { fallback: customDirFallocProvider }),
+      { code: 'EISDIR' }
+    );
+
+    // C. lib/ops_read.js & lib/file_handle.js uncovered branches
+    const rvCustShort = await uringFs.readv(customNoVecWriteFile, [Buffer.alloc(10), Buffer.alloc(10)], 0, {
+      fallback: customStreamProvider,
+    });
+    assert.equal(rvCustShort.bytesRead, 4);
+
+    // UringFileHandle readv & writev fallback when underlying nodeHandle lacks readv/writev
+    const customFhTarget = path.join(tmpDir, 'cov_fh_novec.bin');
+    const rawNodeFh = await fsPromises.open(customFhTarget, 'w+');
+    const strippedHandle = {
+      fd: rawNodeFh.fd,
+      read: (b, o, l, pos) => rawNodeFh.read(b, o, l, pos),
+      write: (b, o, l, pos) => rawNodeFh.write(b, o, l, pos),
+      stat: () => rawNodeFh.stat(),
+      close: () => rawNodeFh.close(),
+    };
+    const wrappedFh = new UringFileHandle('provider', customFhTarget, fs.constants.O_RDWR, 0o666, null, strippedHandle);
+    try {
+      const fhWvRes = await wrappedFh.writev([Buffer.from('XY'), Buffer.from('Z')], 0);
+      assert.equal(fhWvRes.bytesWritten, 3);
+      const fhRvBuf1 = Buffer.alloc(2);
+      const fhRvBuf2 = Buffer.alloc(5);
+      const fhRvRes = await wrappedFh.readv([fhRvBuf1, fhRvBuf2], 0);
+      assert.equal(fhRvRes.bytesRead, 3);
+      assert.equal(fhRvBuf1.toString('utf8'), 'XY');
+      assert.equal(fhRvBuf2.subarray(0, 1).toString('utf8'), 'Z');
+    } finally {
+      await wrappedFh.close();
+    }
+
+    // open() with non-pre-aborted signal that aborts mid-flight (both io_uring and fs fallback)
+    const acOpenUring = new AbortController();
+    const openUringPromise = uringFs.open(customNoVecWriteFile, 'r', 0o666, { signal: acOpenUring.signal });
+    acOpenUring.abort();
+    await assert.rejects(() => openUringPromise, { code: 'ABORT_ERR' });
+
+    const acOpenFs = new AbortController();
+    const openFsPromise = uringFs.open(customNoVecWriteFile, 'r', 0o666, { fallback: 'fs', signal: acOpenFs.signal });
+    acOpenFs.abort();
+    await assert.rejects(() => openFsPromise, { code: 'ABORT_ERR' });
+
+    // withProviderHandle with signal aborted while provider.open() is pending
+    const acWithProvider = new AbortController();
+    let providerClosed = false;
+    const delayedProvider = {
+      open: () => new Promise((resolve) => {
+        setTimeout(() => {
+          resolve({
+            close: async () => { providerClosed = true; },
+          });
+        }, 15);
+      }),
+    };
+    const wphPromise = backendMod.withProviderHandle(delayedProvider, 'virt', 'r', undefined, acWithProvider.signal, 'testOp', async () => {});
+    acWithProvider.abort();
+    await assert.rejects(() => wphPromise, { code: 'ABORT_ERR' });
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(providerClosed, true);
+
+    // D. lib/ops_meta.js uncovered branches
+    await uringFs.access(customNoVecWriteFile, { mode: uringFs.R_OK });
+    await assert.rejects(() => uringFs.access(customNoVecWriteFile, 'bad-mode'), { code: 'ERR_INVALID_ARG_TYPE' });
+    const statOnlyProvider = {
+      readFile: fsPromises.readFile,
+      stat: async () => ({ isFile: () => true }),
+    };
+    await uringFs.access(customNoVecWriteFile, uringFs.F_OK, { fallback: statOnlyProvider });
+
+    const numModeDir = path.join(tmpDir, 'cov_mkdir_num_mode');
+    await uringFs.mkdir(numModeDir, 0o755);
+    assert.ok(fs.statSync(numModeDir).isDirectory());
+
+    const workerMkdirPath = path.join(tmpDir, 'cov_mkdir_worker', 'nested');
+    await uringFs.mkdir(workerMkdirPath, { recursive: true, fallback: 'worker' });
+    assert.ok(fs.statSync(workerMkdirPath).isDirectory());
+
+    await assert.rejects(() => uringFs.mkdir(customNoVecWriteFile, { recursive: true }), { code: 'EEXIST' });
+    await assert.rejects(() => uringFs.mkdir(path.join(customNoVecWriteFile, 'sub'), { recursive: true }), { code: 'ENOTDIR' });
+
+    // Concurrent recursive mkdir triggering EEXIST on nested parent/child
+    const raceDir = path.join(tmpDir, 'cov_mkdir_race', 'a', 'b');
+    await Promise.all([
+      uringFs.mkdir(raceDir, { recursive: true }),
+      uringFs.mkdir(raceDir, { recursive: true }),
+    ]);
+    assert.ok(fs.statSync(raceDir).isDirectory());
+
+    // Symlink loop ELOOP in checkExistingDir & non-EEXIST failure after parent creation in recursive mkdir
+    const loopA = path.join(tmpDir, 'cov_mkdir_loop_a');
+    const loopB = path.join(tmpDir, 'cov_mkdir_loop_b');
+    await uringFs.symlink(loopB, loopA);
+    await uringFs.symlink(loopA, loopB);
+    await assert.rejects(() => uringFs.mkdir(loopA, { recursive: true }), { code: 'ELOOP' });
+
+    const tooLongChild = path.join(tmpDir, 'cov_mkdir_long_parent', 'x'.repeat(300));
+    await assert.rejects(() => uringFs.mkdir(tooLongChild, { recursive: true }), { code: 'ENAMETOOLONG' });
+
+    // lib/ops_read.js worker readv scalar return branch
+    {
+      const pool = backendMod.getWorkerPool();
+      const origExec = pool.exec.bind(pool);
+      pool.exec = async () => 4;
+      try {
+        const scalarRv = await uringFs.readv(customNoVecWriteFile, [Buffer.alloc(4)], 0, { fallback: 'worker' });
+        assert.equal(scalarRv.bytesRead, 4);
+      } finally {
+        pool.exec = origExec;
+        await uringFs.closeFallbackWorkers();
+      }
+    }
+
+    // E. lib/worker_script.js & lib/worker_fallback.js uncovered branches
+    const workerOpsDir = path.join(tmpDir, 'cov_worker_ops');
+    await uringFs.mkdir(workerOpsDir, { fallback: 'worker' });
+    const workerSrc = path.join(workerOpsDir, 'src.txt');
+    const workerSym = path.join(workerOpsDir, 'sym.txt');
+    const workerHard = path.join(workerOpsDir, 'hard.txt');
+    await uringFs.writeFile(workerSrc, 'init-', { fallback: 'worker' });
+    await uringFs.symlink(workerSrc, workerSym, 'file', { fallback: 'worker' });
+    await uringFs.link(workerSrc, workerHard, { fallback: 'worker' });
+    await uringFs.fdatasync(workerSrc, { fallback: 'worker' });
+    await uringFs.writev(workerSrc, [Buffer.from('wv1'), Buffer.from('wv2')], 0, { fallback: 'worker', flush: true });
+    assert.equal(fs.readFileSync(workerSrc, 'utf8'), 'wv1wv2');
+    await assert.rejects(() => uringFs.fallocate(workerOpsDir, 0, 16, { fallback: 'worker' }), { code: 'EISDIR' });
+    await uringFs.unlink(workerSym, { fallback: 'worker' });
+    await uringFs.unlink(workerHard, { fallback: 'worker' });
+    await uringFs.unlink(workerSrc, { fallback: 'worker' });
+    await uringFs.rmdir(workerOpsDir, { fallback: 'worker' });
+    await uringFs.closeFallbackWorkers();
+
+    const covPool = new DedicatedWorkerPool(2);
+    try {
+      // resize before spawning workers, and same-size resize after spawning
+      await covPool.resize(3);
+      assert.equal(covPool.poolSize, 3);
+      const appendWorkerFile = path.join(tmpDir, 'cov_worker_append.txt');
+      await covPool.exec('appendFile', [appendWorkerFile, 'line1\n', 'utf8']);
+      await covPool.exec('appendFile', [appendWorkerFile, 'line2\n', 'utf8']);
+      assert.equal(fs.readFileSync(appendWorkerFile, 'utf8'), 'line1\nline2\n');
+      await covPool.resize(3); // same-size no-op
+      await assert.rejects(() => covPool.exec('unknownOp', []), /Unknown worker operation/);
+
+      // Simulate worker 'error' event while active
+      const pendingErr = covPool.exec('readFile', [appendWorkerFile, 'utf8'], 'utf8');
+      covPool.workers[0].worker.emit('error', new Error('simulated worker error'));
+      await assert.rejects(() => pendingErr, /simulated worker error/);
+    } finally {
+      await covPool.terminate();
+    }
+
+    // F. lib/libc.js branches (non-Linux, musl via report, musl via fs.existsSync, fallback glibc)
+    const origPlatformDesc = Object.getOwnPropertyDescriptor(process, 'platform');
+    const origGetReport = process.report.getReport;
+    const origExistsSync = fs.existsSync;
+    try {
+      Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+      assert.equal(detectLibc(), null);
+
+      Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+      process.report.getReport = () => ({ header: {}, sharedObjects: ['/lib/ld-musl-x86_64.so.1'] });
+      assert.equal(detectLibc(), 'musl');
+
+      process.report.getReport = () => ({ header: {}, sharedObjects: [] });
+      fs.existsSync = (p) => p === '/etc/alpine-release';
+      assert.equal(detectLibc(), 'musl');
+
+      fs.existsSync = () => false;
+      assert.equal(detectLibc(), 'glibc');
+    } finally {
+      if (origPlatformDesc) Object.defineProperty(process, 'platform', origPlatformDesc);
+      process.report.getReport = origGetReport;
+      fs.existsSync = origExistsSync;
+    }
+
+    // G. lib/backend.js env fallback, resolveCustomProvider, loadError, & unsupported-native branches
+    assert.equal(backendMod.resolveCustomProvider(null), null);
+    assert.equal(backendMod.resolveCustomProvider('not-an-object'), null);
+
+    const backendPath = require.resolve('../lib/backend');
+    const cachedBackend = require.cache[backendPath];
+    const nativeBuildPath = path.join(__dirname, '..', 'build', 'Release', 'uring_fs.node');
+    const resolvedNativePath = fs.existsSync(nativeBuildPath) ? require.resolve(nativeBuildPath) : null;
+    const cachedNative = resolvedNativePath ? require.cache[resolvedNativePath] : undefined;
+    const origArchDesc = Object.getOwnPropertyDescriptor(process, 'arch');
+    const origEnv = {
+      URING_FS_FALLBACK: process.env.URING_FS_FALLBACK,
+      URING_FS_PREBUILD_ONLY: process.env.URING_FS_PREBUILD_ONLY,
+      URING_FS_IGNORE_PREBUILDS: process.env.URING_FS_IGNORE_PREBUILDS,
+      URING_FS_DISABLE_NATIVE: process.env.URING_FS_DISABLE_NATIVE,
+    };
+    try {
+      process.env.URING_FS_DISABLE_NATIVE = '1';
+      delete require.cache[backendPath];
+      const disabledBackend = require(backendPath);
+      assert.equal(disabledBackend.getNative(), null);
+      assert.match(disabledBackend.getUnsupportedReason(), /URING_FS_DISABLE_NATIVE=1/);
+
+      process.env.URING_FS_DISABLE_NATIVE = 'stub';
+      delete require.cache[backendPath];
+      const stubBackend = require(backendPath);
+      assert.equal(stubBackend.isUringSupported(), false);
+      assert.match(stubBackend.getUnsupportedReason(), /URING_FS_DISABLE_NATIVE=stub/);
+      assert.equal(stubBackend.setOptimisticReadSize(4096), 4096);
+      delete process.env.URING_FS_DISABLE_NATIVE;
+
+      process.env.URING_FS_PREBUILD_ONLY = '1';
+      process.env.URING_FS_IGNORE_PREBUILDS = '1';
+
+      for (const [envVal, expectedBackend] of [
+        ['fs', 'fs'],
+        ['worker', 'worker'],
+        ['none', 'none'],
+      ]) {
+        process.env.URING_FS_FALLBACK = envVal;
+        delete require.cache[backendPath];
+        const freshBackend = require(backendPath);
+        assert.equal(freshBackend.getNative(), null);
+        assert.equal(freshBackend.getActiveBackend(), expectedBackend);
+        assert.equal(freshBackend.getUnsupportedReason(), 'Unsupported platform');
+        const st = freshBackend.getRingStats();
+        assert.equal(st.supported, false);
+        assert.equal(st.syscallsSavedByBatching, 0);
+      }
+
+      // Exercise candidate require() catch -> loadError -> getUnsupportedReason()
+      delete process.env.URING_FS_FALLBACK;
+      process.env.URING_FS_PREBUILD_ONLY = '1';
+      process.env.URING_FS_IGNORE_PREBUILDS = '0';
+      Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+      Object.defineProperty(process, 'arch', { value: 'fake_arch_for_test', configurable: true });
+      delete require.cache[backendPath];
+      const errBackend = require(backendPath);
+      assert.equal(errBackend.getNative(), null);
+      assert.match(errBackend.getUnsupportedReason(), /^Failed to load native binary:/);
+
+      // Exercise native.getUnsupportedReason() when native addon loads but isSupported() is false
+      if (resolvedNativePath && cachedNative) {
+        if (origPlatformDesc) Object.defineProperty(process, 'platform', origPlatformDesc);
+        if (origArchDesc) Object.defineProperty(process, 'arch', origArchDesc);
+        process.env.URING_FS_PREBUILD_ONLY = '0';
+        require.cache[resolvedNativePath] = {
+          id: resolvedNativePath,
+          filename: resolvedNativePath,
+          loaded: true,
+          exports: {
+            isSupported: () => false,
+            getUnsupportedReason: () => 'Simulated old kernel',
+          },
+        };
+        delete require.cache[backendPath];
+        const mockReasonBackend = require(backendPath);
+        assert.equal(mockReasonBackend.getUnsupportedReason(), 'Simulated old kernel');
+
+        require.cache[resolvedNativePath].exports.getUnsupportedReason = () => '';
+        assert.equal(mockReasonBackend.getUnsupportedReason(), 'io_uring is not supported in this environment');
+      }
+    } finally {
+      if (origPlatformDesc) Object.defineProperty(process, 'platform', origPlatformDesc);
+      if (origArchDesc) Object.defineProperty(process, 'arch', origArchDesc);
+      if (resolvedNativePath && cachedNative) require.cache[resolvedNativePath] = cachedNative;
+      for (const [k, v] of Object.entries(origEnv)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      require.cache[backendPath] = cachedBackend;
+    }
+  });
+
+  test('30. Round 3 Security (CWE-158 null-byte paths), Safe Integers, AbortSignal validation, and numeric 0 flags', async () => {
+    const testFile = path.join(tmpDir, 'round3_hardening.txt');
+    await uringFs.writeFile(testFile, 'round3-payload');
+
+    // A. CWE-158 null-byte path rejection across string, Buffer, and URL
+    await assert.rejects(
+      () => uringFs.readFile('foo\0bar'),
+      (err) => err instanceof TypeError && err.code === 'ERR_INVALID_ARG_VALUE'
+    );
+    await assert.rejects(
+      () => uringFs.writeFile(Buffer.from('a\0b'), 'x'),
+      (err) => err instanceof TypeError && err.code === 'ERR_INVALID_ARG_VALUE'
+    );
+    await assert.rejects(
+      () => uringFs.open('x\0y'),
+      (err) => err instanceof TypeError && err.code === 'ERR_INVALID_ARG_VALUE'
+    );
+
+    // B. Unsafe integer rejection (ERR_OUT_OF_RANGE) and optimisticReadSize clamping
+    await assert.rejects(
+      () => uringFs.readAt(testFile, 1e20, 10),
+      (err) => err instanceof RangeError && err.code === 'ERR_OUT_OF_RANGE'
+    );
+    await assert.rejects(
+      () => uringFs.readAt(testFile, 0, Number.MAX_SAFE_INTEGER + 2),
+      (err) => err instanceof RangeError && err.code === 'ERR_OUT_OF_RANGE'
+    );
+    await assert.rejects(
+      () => uringFs.fallocate(testFile, 1e20, 10),
+      (err) => err instanceof RangeError && err.code === 'ERR_OUT_OF_RANGE'
+    );
+    await assert.rejects(
+      () => uringFs.readBatchAt(testFile, [[1e20, 5]]),
+      (err) => err instanceof RangeError && err.code === 'ERR_OUT_OF_RANGE'
+    );
+    await assert.rejects(
+      () => uringFs.readBatchAt(testFile, [[0, Number.MAX_SAFE_INTEGER + 2]]),
+      (err) => err instanceof RangeError && err.code === 'ERR_OUT_OF_RANGE'
+    );
+    await assert.rejects(
+      () => uringFs.readv(testFile, [Buffer.alloc(4)], 1e20),
+      (err) => err instanceof RangeError && err.code === 'ERR_OUT_OF_RANGE'
+    );
+    await assert.rejects(
+      () => uringFs.access(testFile, 1e20),
+      (err) => err instanceof RangeError && err.code === 'ERR_OUT_OF_RANGE'
+    );
+
+    assert.throws(
+      () => uringFs.setOptimisticReadSize(1e20),
+      (err) => err instanceof TypeError && err.code === 'ERR_INVALID_ARG_VALUE'
+    );
+    await assert.rejects(
+      () => uringFs.readFile(testFile, { optimisticReadSize: 1e20 }),
+      (err) => err instanceof TypeError && err.code === 'ERR_INVALID_ARG_VALUE'
+    );
+
+    const prevOptSize = uringFs.getRingStats().optimisticReadSize;
+    try {
+      const clampedSize = uringFs.setOptimisticReadSize(0xffffffff);
+      assert.equal(clampedSize, 0x7ffff000);
+      assert.equal(uringFs.getRingStats().optimisticReadSize, 0x7ffff000);
+
+      const readClamped = await uringFs.readFile(testFile, { encoding: 'utf8', optimisticReadSize: 0xffffffff });
+      assert.equal(readClamped, 'round3-payload');
+    } finally {
+      uringFs.setOptimisticReadSize(prevOptSize);
+    }
+
+    // C. Invalid AbortSignal rejection (ERR_INVALID_ARG_TYPE) and fh.stat({ signal })
+    await assert.rejects(
+      () => uringFs.readFile(testFile, { signal: {} }),
+      (err) => err instanceof TypeError && err.code === 'ERR_INVALID_ARG_TYPE'
+    );
+    await assert.rejects(
+      () => uringFs.writeFile(testFile, 'ignored', { signal: 123 }),
+      (err) => err instanceof TypeError && err.code === 'ERR_INVALID_ARG_TYPE'
+    );
+    await assert.rejects(
+      () => uringFs.stat(testFile, { signal: { aborted: false } }),
+      (err) => err instanceof TypeError && err.code === 'ERR_INVALID_ARG_TYPE'
+    );
+
+    for (const openOpts of [{ flags: 0 }, { flags: 0, fallback: 'fs' }]) {
+      const fh = await uringFs.open(testFile, openOpts);
+      try {
+        const readOut = await fh.readAt(0, 14, 'utf8');
+        assert.equal(readOut, 'round3-payload');
+
+        const st = await fh.stat();
+        assert.equal(st.size, 14);
+
+        await assert.rejects(
+          () => fh.stat({ signal: 'bad' }),
+          (err) => err instanceof TypeError && err.code === 'ERR_INVALID_ARG_TYPE'
+        );
+        await assert.rejects(
+          () => fh.stat({ signal: AbortSignal.abort() }),
+          { name: 'AbortError', code: 'ABORT_ERR' }
+        );
+      } finally {
+        await fh.close();
+      }
+    }
+
+    // D. Numeric 0 (O_RDONLY) flag preserved via ?? in writev (fails with EBADF/EACCES on read-only open if existing)
+    const roFile = path.join(tmpDir, 'round3_ro_writev.txt');
+    await uringFs.writeFile(roFile, 'readonly');
+    await assert.rejects(
+      () => uringFs.writev(roFile, [Buffer.from('x')], 0, { flags: 0 }),
+      (err) => err && (err.code === 'EBADF' || err.code === 'EACCES' || err.code === 'EINVAL')
+    );
+  });
+
+  test('31. Round 4: Native io_uring Caller Stack Traces (err.stack) and Worker AbortSignal Safety', async () => {
+    // A. Caller stack frames on native io_uring rejections
+    const missingPath = path.join(tmpDir, 'definitely_missing_round4.txt');
+    async function invokeReadFileMissing() {
+      return await uringFs.readFile(missingPath);
+    }
+    await assert.rejects(
+      () => invokeReadFileMissing(),
+      (err) => {
+        assert.equal(err.code, 'ENOENT');
+        assert.match(err.stack, /\n\s+at /);
+        assert.match(err.stack, /invokeReadFileMissing/);
+        return true;
+      }
+    );
+
+    await assert.rejects(
+      () => uringFs.readAt(tmpDir, 0, 10),
+      (err) => {
+        assert.equal(err.code, 'EISDIR');
+        assert.match(err.stack, /\n\s+at /);
+        return true;
+      }
+    );
+
+    await assert.rejects(
+      () => uringFs.stat(missingPath),
+      (err) => {
+        assert.equal(err.code, 'ENOENT');
+        assert.match(err.stack, /\n\s+at /);
+        return true;
+      }
+    );
+
+    // Also verify UringFileHandle native rejections include caller stack frames
+    const roFile = path.join(tmpDir, 'round4_ro_handle.txt');
+    await uringFs.writeFile(roFile, 'ro');
+    const fh = await uringFs.open(roFile, 'r');
+    try {
+      await assert.rejects(
+        () => fh.write('cannot-write'),
+        (err) => {
+          assert.ok(err && err.code);
+          assert.match(err.stack, /\n\s+at /);
+          return true;
+        }
+      );
+    } finally {
+      await fh.close();
+    }
+
+    // Also verify AbortSignal-wrapped native rejection includes caller stack frames
+    const ac = new AbortController();
+    await assert.rejects(
+      () => uringFs.readFile(missingPath, { signal: ac.signal }),
+      (err) => {
+        assert.equal(err.code, 'ENOENT');
+        assert.match(err.stack, /\n\s+at /);
+        return true;
+      }
+    );
+
+    // C. rmdir with fallback: 'worker' and live AbortSignal (no DataCloneError)
+    const workerRmdirDir = path.join(tmpDir, 'round4_worker_rmdir_signal');
+    await uringFs.mkdir(workerRmdirDir);
+    const liveAc = new AbortController();
+    await uringFs.rmdir(workerRmdirDir, { fallback: 'worker', signal: liveAc.signal });
+    assert.equal(await uringFs.exists(workerRmdirDir), false);
   });
 });
