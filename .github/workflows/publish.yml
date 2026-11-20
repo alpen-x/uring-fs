@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -49,20 +48,33 @@ jobs:
       - name: Install npm dependencies
         run: npm install --ignore-scripts
 
-      - name: Build prebuilt binary (Ubuntu / glibc)
+      - name: Build and verify prebuilt binary (Ubuntu / glibc)
         if: matrix.libc == 'glibc'
         run: |
           sudo apt-get update
           sudo apt-get install -y liburing-dev build-essential python3
+          sudo sysctl -w kernel.io_uring_disabled=0 || true
           npm run prebuild
+          f=$(echo prebuilds/linux-*/uring_fs.glibc.node)
+          test -f "$f"
+          dynsym=$(nm -D "$f")
+          ! printf '%s\n' "$dynsym" | grep -q 'io_uring_'
+          URING_FS_PREBUILD_ONLY=1 node -e "if (!require('.').isUringSupported()) { console.error('Prebuild io_uring unsupported:', require('.').getUnsupportedReason()); process.exit(1); }"
+          URING_FS_PREBUILD_ONLY=1 npm test
 
-      - name: Build prebuilt binary (Alpine / musl via Docker)
+      - name: Build and verify prebuilt binary (Alpine / musl via Docker)
         if: matrix.libc == 'musl'
         run: |
-          docker run --rm -v "$PWD:/work" -w /work alpine:3.20 sh -c "
-            apk add --no-cache nodejs npm python3 make g++ liburing-dev linux-headers &&
-            (apk add --no-cache liburing-static || true) &&
-            npm run prebuild
+          sudo sysctl -w kernel.io_uring_disabled=0 || true
+          docker run --rm --privileged -v "$PWD:/work" -w /work alpine:3.21 sh -c "
+            apk add --no-cache nodejs npm python3 make g++ liburing-dev linux-headers binutils &&
+            npm run prebuild &&
+            f=\$(echo prebuilds/linux-*/uring_fs.musl.node) &&
+            test -f \"\$f\" &&
+            dynsym=\$(nm -D \"\$f\") &&
+            ! printf '%s\n' \"\$dynsym\" | grep -q 'io_uring_' &&
+            URING_FS_PREBUILD_ONLY=1 node -e \"if (!require('.').isUringSupported()) { console.error('Prebuild io_uring unsupported:', require('.').getUnsupportedReason()); process.exit(1); }\" &&
+            URING_FS_PREBUILD_ONLY=1 npm test
           "
           sudo chown -R "$(id -u):$(id -g)" prebuilds build || true
 
@@ -77,6 +89,9 @@ jobs:
     name: Build, Verify & Publish to npm
     needs: build-prebuilds
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -104,15 +119,20 @@ jobs:
           merge-multiple: true
 
       - name: Verify prebuilt binaries
-        run: ls -laR prebuilds/
+        run: |
+          ls -laR prebuilds/
+          test -f prebuilds/linux-x64/uring_fs.glibc.node
+          test -f prebuilds/linux-x64/uring_fs.musl.node
+          test -f prebuilds/linux-arm64/uring_fs.glibc.node
+          test -f prebuilds/linux-arm64/uring_fs.musl.node
 
       - name: Install dependencies and build native addon
         run: npm install
 
       - name: Run full test suite before publishing
-        run: npm test
+        run: npm run check
 
-      - name: Publish or Stage package to npm (OIDC Trusted Publishing or NPM_TOKEN)
+      - name: Publish package to npm (OIDC Trusted Publishing or NPM_TOKEN)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
@@ -121,4 +141,4 @@ jobs:
             unset NODE_AUTH_TOKEN
             npm config delete //registry.npmjs.org/:_authToken || true
           fi
-          npm publish --provenance --access public || npm stage publish --provenance --access public
+          npm publish --provenance --access public

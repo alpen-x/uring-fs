@@ -46,20 +46,30 @@ let native = null;
 let loadError = null;
 
 const candidates = [];
-if (process.env.URING_FS_PREBUILD_ONLY !== '1') {
-  candidates.push(pathModule.join(__dirname, 'build', 'Release', 'uring_fs.node'));
-}
-
-if (process.platform === 'linux' && process.env.URING_FS_IGNORE_PREBUILDS !== '1') {
-  const libc = detectLibc();
-  if (libc) {
-    candidates.push(pathModule.join(__dirname, 'prebuilds', `linux-${process.arch}`, `uring_fs.${libc}.node`));
-    candidates.push(`@alpenx/uring-fs-linux-${process.arch}-${libc}`);
-    candidates.push(`@uring-fs/linux-${process.arch}-${libc}`);
+if (process.env.URING_FS_DISABLE_NATIVE === '1') {
+  loadError = new Error('Native addon disabled via URING_FS_DISABLE_NATIVE=1');
+} else if (process.env.URING_FS_DISABLE_NATIVE === 'stub') {
+  native = {
+    isSupported: () => false,
+    getUnsupportedReason: () => 'Simulated addon_stub via URING_FS_DISABLE_NATIVE=stub',
+    setOptimisticReadSize: (bytes) => Math.max(0, Math.trunc(Number(bytes) || 0)),
+  };
+} else {
+  if (process.env.URING_FS_PREBUILD_ONLY !== '1') {
+    candidates.push(pathModule.join(__dirname, 'build', 'Release', 'uring_fs.node'));
   }
-  candidates.push(pathModule.join(__dirname, 'prebuilds', `linux-${process.arch}`, 'uring_fs.node'));
-  candidates.push(`@alpenx/uring-fs-linux-${process.arch}`);
-  candidates.push(`@uring-fs/linux-${process.arch}`);
+
+  if (process.platform === 'linux' && process.env.URING_FS_IGNORE_PREBUILDS !== '1') {
+    const libc = detectLibc();
+    if (libc) {
+      candidates.push(pathModule.join(__dirname, 'prebuilds', `linux-${process.arch}`, `uring_fs.${libc}.node`));
+      candidates.push(`@alpenx/uring-fs-linux-${process.arch}-${libc}`);
+      candidates.push(`@uring-fs/linux-${process.arch}-${libc}`);
+    }
+    candidates.push(pathModule.join(__dirname, 'prebuilds', `linux-${process.arch}`, 'uring_fs.node'));
+    candidates.push(`@alpenx/uring-fs-linux-${process.arch}`);
+    candidates.push(`@uring-fs/linux-${process.arch}`);
+  }
 }
 
 for (const candidate of candidates) {

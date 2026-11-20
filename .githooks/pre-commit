@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+set -e
+echo "[git pre-commit] Running linter & static checks (npm run lint)..."
+npm run lint

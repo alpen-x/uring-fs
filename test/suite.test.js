@@ -2013,41 +2013,51 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     if (process.platform === 'linux') {
       const prebuildPath = path.join(__dirname, '..', 'prebuilds', `linux-${process.arch}`, `uring_fs.${libc}.node`);
       const buildPath = path.join(__dirname, '..', 'build', 'Release', 'uring_fs.node');
+      let createdTempPrebuild = false;
       if (fs.existsSync(buildPath) && !fs.existsSync(prebuildPath)) {
         fs.mkdirSync(path.dirname(prebuildPath), { recursive: true });
         fs.copyFileSync(buildPath, prebuildPath);
+        createdTempPrebuild = true;
       }
 
-      if (fs.existsSync(prebuildPath)) {
-        const installScript = path.join(__dirname, '..', 'scripts', 'install.js');
-        const cleanEnv = {
-          ...process.env,
-          URING_FS_BUILD_FROM_SOURCE: '0',
-          URING_FS_IGNORE_PREBUILDS: '0',
-          URING_FS_MARCH_NATIVE: '0',
-          npm_config_build_from_source: '',
-          npm_config_march_native: '',
-        };
-        const installRes = spawnSync(process.execPath, [installScript], {
-          cwd: path.join(__dirname, '..'),
-          env: cleanEnv,
-          encoding: 'utf8',
-        });
-        assert.equal(installRes.status, 0);
-        assert.match(installRes.stdout, /\[uring-fs\] Using prebuilt native binary/);
-
-        // Verify loading solely from prebuilds when URING_FS_PREBUILD_ONLY=1
-        const prebuildOnlyRes = spawnSync(
-          process.execPath,
-          ['-e', 'const u = require("./index.js"); console.log("SUPPORTED:", u.isUringSupported());'],
-          {
+      try {
+        if (fs.existsSync(prebuildPath)) {
+          const installScript = path.join(__dirname, '..', 'scripts', 'install.js');
+          const cleanEnv = {
+            ...process.env,
+            URING_FS_BUILD_FROM_SOURCE: '0',
+            URING_FS_IGNORE_PREBUILDS: '0',
+            URING_FS_MARCH_NATIVE: '0',
+            npm_config_build_from_source: '',
+            npm_config_march_native: '',
+          };
+          const installRes = spawnSync(process.execPath, [installScript], {
             cwd: path.join(__dirname, '..'),
-            env: { ...cleanEnv, URING_FS_PREBUILD_ONLY: '1' },
+            env: cleanEnv,
             encoding: 'utf8',
-          }
-        );
-        assert.equal(prebuildOnlyRes.status, 0);
-        assert.match(prebuildOnlyRes.stdout, /SUPPORTED: (true|false)/);
+          });
+          assert.equal(installRes.status, 0);
+          assert.match(installRes.stdout, /\[uring-fs\] Using prebuilt native binary/);
+
+          // Verify loading solely from prebuilds when URING_FS_PREBUILD_ONLY=1
+          const prebuildOnlyRes = spawnSync(
+            process.execPath,
+            ['-e', 'const u = require("./index.js"); console.log("SUPPORTED:", u.isUringSupported());'],
+            {
+              cwd: path.join(__dirname, '..'),
+              env: { ...cleanEnv, URING_FS_PREBUILD_ONLY: '1' },
+              encoding: 'utf8',
+            }
+          );
+          assert.equal(prebuildOnlyRes.status, 0);
+          assert.match(prebuildOnlyRes.stdout, /SUPPORTED: (true|false)/);
+        }
+      } finally {
+        if (createdTempPrebuild && fs.existsSync(prebuildPath)) {
+          try {
+            fs.unlinkSync(prebuildPath);
+          } catch {}
+        }
       }
 
       // C. Static liburing.a & ELF dynamic symbol hiding (0 exported io_uring_* symbols)
