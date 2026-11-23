@@ -1,4 +1,13 @@
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wconversion"
+#pragma GCC diagnostic ignored "-Wsign-conversion"
+#pragma GCC diagnostic ignored "-Wshadow"
+#endif
 #include <napi.h>
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 Napi::Value IsSupported(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(info.Env(), false);
@@ -25,14 +34,22 @@ Napi::Value SetOptimisticReadSize(const Napi::CallbackInfo& info) {
         return env.Null();
     }
     int64_t val = info[0].As<Napi::Number>().Int64Value();
-    size_t clamped = val <= 0 ? 0 : static_cast<size_t>(val);
+    size_t clamped = 0;
+    if (val > 0) {
+        clamped = static_cast<uint64_t>(val) > 0x7ffff000ULL ? static_cast<size_t>(0x7ffff000ULL) : static_cast<size_t>(val);
+    }
     return Napi::Number::New(env, static_cast<double>(clamped));
+}
+
+Napi::Value SetFaultInjection(const Napi::CallbackInfo& info) {
+    return info.Env().Undefined();
 }
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("isSupported", Napi::Function::New(env, IsSupported));
     exports.Set("getUnsupportedReason", Napi::Function::New(env, GetUnsupportedReason));
     exports.Set("setOptimisticReadSize", Napi::Function::New(env, SetOptimisticReadSize));
+    exports.Set("setFaultInjection", Napi::Function::New(env, SetFaultInjection));
     return exports;
 }
 
