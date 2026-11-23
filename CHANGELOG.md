@@ -5,6 +5,29 @@ All notable changes to `uring-fs` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.3] - 2026-11-20
+
+### Changed & Refactored
+- **Modular C++ Single-TU Architecture (`src/addon.cc` + `src/internal/*.hpp`):**
+  - Decomposed `src/addon.cc` (`4,371` -> `187` lines) into 9 focused single-translation-unit headers under `src/internal/` (`uring_compat.hpp`, `ring_types.hpp`, `ring_state.hpp`, `scheduler.hpp`, `completions_linked.hpp`, `completions_stages.hpp`, `ring_loop.hpp`, `napi_ops_path.hpp`, `napi_ops_handle.hpp`), eliminating ~900 lines of duplicated SQE and N-API boilerplate while preserving `-O3` inlining.
+  - Enabled strict compiler diagnostics (`-Wconversion -Wsign-conversion -Wshadow -Wformat=2 -Wundef`) in `binding.gyp` with 0 warnings under `g++ 13.3 -fanalyzer`.
+- **Modular JavaScript Layer (`index.js` + `lib/*.js`):**
+  - Decomposed `index.js` (`2,527` -> `122` lines) into 11 cohesive modules under `lib/` (`libc.js`, `constants.js`, `stats.js`, `validators.js`, `backend.js`, `file_handle.js`, `ops_read.js`, `ops_write.js`, `ops_meta.js`, `worker_fallback.js`, `worker_script.js`) with 100.00% line coverage across all 13 production JS files.
+  - Extracted standalone `lib/libc.js` so `scripts/install.js` and `scripts/prebuild.js` run with zero native addon side effects at install time.
+  - Extracted `lib/worker_script.js` to eliminate `new Worker(..., { eval: true })`, added `DedicatedWorkerPool.prototype.resize()` for dynamic worker pool scaling via `configure({ workerPoolSize })`, and parallelized `UringFileHandle.prototype.readBatchAt` via `Promise.all`.
+
+### Fixed & Hardened
+- **Linked Chain Partial-Write, Short-Read & `-ECANCELED` Continuation (`src/internal/completions_linked.hpp`, `completions_stages.hpp`):**
+  - Fixed `OP_WRITE_FILE` linked chain continuation after short writes (`0 < res < size`) to reopen without `O_TRUNC` while preserving `O_APPEND | O_SYNC | O_DSYNC`, and to reject with `EIO` if `write` returns `0` bytes on a non-empty buffer.
+  - Fixed `HandleLinkedSimpleOp`, `HandleLinkedReadFile` (Pair 1 & Pair 2), `HandleLinkedReadAt`, `OP_FH_READ_AT`, and `HandleLinkedBatchAt` to track explicit `close_canceled` state and retry/continue cleanly on `-ECANCELED`, `-EINTR`, `-EAGAIN`, or partial reads, verified via deterministic C++ CQE fault injection (`setFaultInjection`).
+- **Security & Input Validation (`lib/validators.js`, `src/internal/napi_ops_*.hpp`):**
+  - Added CWE-158 null-byte (`\0`) path truncation rejection (`ERR_INVALID_ARG_VALUE`) in `normalizePath()`.
+  - Enforced `Number.isSafeInteger` across all file offsets, lengths, and modes (`ERR_OUT_OF_RANGE`), clamped `optimisticReadSize` to `MAX_IO_CHUNK` (`0x7ffff000`), and clamped `fadvise` length to `UINT32_MAX`.
+  - Fixed `ExtractArrayBufferView` to check `IsDataView()` and `IsBuffer()` before `IsTypedArray()`, added detached `ArrayBuffer` and `IOV_MAX` (`1024`) guards, and extended full `ArrayBufferView` (`DataView`, `Uint16Array`, etc.) support to `fh.read`, `fh.write`, `readv`, `writev`, `fh.readv`, and `fh.writev`.
+  - Preserved caller async JavaScript stack traces (`err.stack`) on native `io_uring` rejections (`attachCallerStack`).
+  - Guarded `EnsureCredentialsSafe()` against live `UringFileHandle` direct descriptor slots, replaced private `poll_handle.io_watcher.fd` mutation with dynamic `uv_close` + `uv_poll_init`, and tracked all in-flight `IORequest*` instances in `live_requests` for leak-free `CleanupModule` teardown.
+  - Fixed `mkdir(..., { recursive: true })` on dangling symlinks to throw `EEXIST` instead of `ENOENT`, fixed 0-byte `fh.readv` on directories to throw `EISDIR`, and sanitized `rmdir` worker options when a live `AbortSignal` is passed.
+
 ## [1.3.2] - 2026-11-17
 
 ### Added

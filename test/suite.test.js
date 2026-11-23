@@ -2163,7 +2163,7 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     await uringFs.closeFallbackWorkers();
   });
 
-  test('25. DedicatedWorkerPool.resize(), parallel fh.readBatchAt, and ArrayBufferView vectored I/O', async () => {
+  test('25. DedicatedWorkerPool.resize(), parallel fh.readBatchAt, and C++ ArrayBufferView/ReadBatchAt validation', async () => {
     const { DedicatedWorkerPool } = require('../lib/worker_fallback');
 
     // A. DedicatedWorkerPool.resize() grow, shrink idle, shrink busy, and configure({ workerPoolSize })
@@ -2294,13 +2294,26 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     } finally {
       await abvFh.close();
     }
+
+    // D. Native ReadBatchAtUring validation directly (if build/Release/uring_fs.node is compiled with liburing)
+    const nativeAddonPath = path.join(__dirname, '..', 'build', 'Release', 'uring_fs.node');
+    if (!process.env.URING_FS_DISABLE_NATIVE && fs.existsSync(nativeAddonPath)) {
+      const native = require(nativeAddonPath);
+      if (typeof native.readBatchAt === 'function') {
+        assert.throws(() => native.readBatchAt(batchFhFile, [0, 10], [5]), RangeError);
+        assert.throws(() => native.readBatchAt(batchFhFile, ['bad'], [5]), TypeError);
+        assert.throws(() => native.readBatchAt(batchFhFile, [0], ['bad']), TypeError);
+        assert.throws(() => native.readBatchAt(batchFhFile, [-1], [5]), RangeError);
+        assert.throws(() => native.readBatchAt(batchFhFile, [0], [-5]), RangeError);
+      }
+    }
   });
 
   test('26. Core modularization, DataView/Uint16Array fh.read/write, empty readBatchAt encoding check, worker DataCloneError cleanup, and npm pack check', async () => {
     const { spawnSync } = require('node:child_process');
     const { DedicatedWorkerPool } = require('../lib/worker_fallback');
 
-    // A & B. fh.read and fh.write with DataView and Uint16Array (io_uring + fs fallback) + empty readBatchAt encoding check
+    // A. fh.read and fh.write with DataView and Uint16Array (io_uring + fs fallback)
     const abvHandleFile = path.join(tmpDir, 'fh_abv_rw.bin');
     for (const opts of [{}, { fallback: 'fs' }]) {
       const fh = await uringFs.open(abvHandleFile, 'w+', 0o666, opts);
@@ -2333,12 +2346,36 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
         assert.equal(r2.buffer, dvOut);
         assert.equal(Buffer.from(dvOut.buffer, dvOut.byteOffset, dvOut.byteLength).toString('utf8'), 'EFGH');
 
+        // B. fh.readBatchAt([], 'invalid-encoding') rejects with ERR_INVALID_ARG_VALUE
         await assert.rejects(
           () => fh.readBatchAt([], 'invalid-encoding'),
           (err) => err instanceof TypeError && err.code === 'ERR_INVALID_ARG_VALUE'
         );
       } finally {
         await fh.close();
+      }
+    }
+
+    // C. C++ IOV_MAX > 1024 and detached ArrayBufferView guards
+    if (uringFs.isUringSupported()) {
+      const iovFile = path.join(tmpDir, 'iov_max_guard.bin');
+      await uringFs.writeFile(iovFile, 'test');
+      const tooManyBufs = Array.from({ length: 1025 }, () => Buffer.alloc(1));
+      await assert.rejects(
+        () => uringFs.readv(iovFile, tooManyBufs, 0),
+        (err) => err instanceof RangeError && err.code === 'ERR_OUT_OF_RANGE'
+      );
+
+      if (typeof ArrayBuffer.prototype.transfer === 'function') {
+        const { getNative } = require('../lib/backend');
+        const native = getNative();
+        const detachedAb = new ArrayBuffer(16);
+        const detachedDv = new DataView(detachedAb);
+        detachedAb.transfer();
+        assert.throws(
+          () => native.writev(iovFile, [detachedDv], 0),
+          (err) => err && (err.code === 'EINVAL' || err.errno === -22)
+        );
       }
     }
 
@@ -2360,7 +2397,7 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
       await pool.terminate();
     }
 
-    // E. Verify all modular lib/*.js files appear in npm pack --dry-run
+    // E. Verify all modular src/internal/*.hpp and lib/*.js files appear in npm pack --dry-run
     const packRes = spawnSync('npm', ['pack', '--dry-run'], {
       cwd: path.join(__dirname, '..'),
       encoding: 'utf8',
@@ -2369,7 +2406,15 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     const packOutput = `${packRes.stdout}\n${packRes.stderr}`;
     const expectedFiles = [
       'src/addon.cc',
-      'src/addon_stub.cc',
+      'src/internal/uring_compat.hpp',
+      'src/internal/ring_types.hpp',
+      'src/internal/ring_state.hpp',
+      'src/internal/scheduler.hpp',
+      'src/internal/completions_linked.hpp',
+      'src/internal/completions_stages.hpp',
+      'src/internal/ring_loop.hpp',
+      'src/internal/napi_ops_path.hpp',
+      'src/internal/napi_ops_handle.hpp',
       'index.js',
       'lib/libc.js',
       'lib/constants.js',
@@ -2388,7 +2433,7 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     }
   });
 
-  test('27. Round 2 DRY & KISS edge cases: mkdir dangling symlink ENOENT parity, fh.readv 0-byte dir EISDIR, TypedArray writeFile, and open() direct-slot accounting', async () => {
+  test('27. Round 2 DRY & KISS edge cases: mkdir dangling symlink ENOENT parity, fh.readv 0-byte dir EISDIR, TypedArray writeFile, and open() credential safety', async () => {
     // A. mkdir(danglingSymlink, { recursive: true }) throws ENOENT (matching node:fs/promises across all backends)
     const danglingTarget = path.join(tmpDir, 'does_not_exist_target');
     const danglingLink = path.join(tmpDir, 'dangling_symlink_dir');
@@ -2430,22 +2475,263 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     await uringFs.writeFile(taFile, dv);
     assert.deepEqual(await uringFs.readFile(taFile), Buffer.from([0x55, 0x66, 0x77, 0x88]));
 
-    // D. open() direct-slot accounting
+    // D. open() after EnsureCredentialsSafe check and direct-slot accounting
     const statsBefore = uringFs.getRingStats();
     const credFile = path.join(tmpDir, 'open_cred_check.txt');
     await uringFs.writeFile(credFile, 'cred-ok');
 
-    const fh = await uringFs.open(credFile, 'r');
-    try {
-      if (statsBefore.directFdsSupported) {
-        assert.ok(fh.directSlot >= 0);
-        assert.equal(uringFs.getRingStats().directFdsInUse, statsBefore.directFdsInUse + 1);
+    if (
+      uringFs.isUringSupported() &&
+      typeof process.geteuid === 'function' &&
+      process.geteuid() === 0 &&
+      typeof process.seteuid === 'function'
+    ) {
+      fs.chmodSync(tmpDir, 0o755);
+      fs.chmodSync(credFile, 0o644);
+      const prevUid = process.geteuid();
+      const beforeResets = statsBefore.credentialResets;
+      process.seteuid(65534);
+      try {
+        const fh = await uringFs.open(credFile, 'r');
+        try {
+          assert.equal(await fh.readAt(0, 7, 'utf8'), 'cred-ok');
+        } finally {
+          await fh.close();
+        }
+        assert.ok(uringFs.getRingStats().credentialResets > beforeResets);
+      } finally {
+        process.seteuid(prevUid);
       }
-      assert.equal(await fh.readAt(0, 7, 'utf8'), 'cred-ok');
-    } finally {
-      await fh.close();
+    } else {
+      const fh = await uringFs.open(credFile, 'r');
+      try {
+        if (statsBefore.directFdsSupported) {
+          assert.ok(fh.directSlot >= 0);
+          assert.equal(uringFs.getRingStats().directFdsInUse, statsBefore.directFdsInUse + 1);
+        }
+        assert.equal(await fh.readAt(0, 7, 'utf8'), 'cred-ok');
+      } finally {
+        await fh.close();
+      }
+      assert.equal(uringFs.getRingStats().directFdsInUse, statsBefore.directFdsInUse);
     }
-    assert.equal(uringFs.getRingStats().directFdsInUse, statsBefore.directFdsInUse);
+  });
+
+  test('28. Deterministic C++ Kernel CQE Fault Injection (partial writes, 0-byte write EIO, linked CQE 1 ECANCELED/EAGAIN retries, Pair 2 short-read continuation)', async () => {
+    const { getNative } = require('../lib/backend');
+    const native = getNative();
+    if (!uringFs.isUringSupported() || !native || typeof native.setFaultInjection !== 'function') {
+      return;
+    }
+
+    const slotsBeforeAll = uringFs.getRingStats().directFdsInUse;
+
+    try {
+      // Invalid argument validation on setFaultInjection
+      assert.throws(() => native.setFaultInjection('invalid'), TypeError);
+
+      // A. Linked OP_WRITE_FILE Partial Write Continuation (flush: false, flush: true, O_SYNC, 'rs+', and 'as')
+      const payload32 = Buffer.from('0123456789ABCDEFGHIJKLMNOPQRSTUV'); // 32 bytes
+      assert.equal(payload32.length, 32);
+
+      // A1. flush: false
+      const partialNoFlush = path.join(tmpDir, 'fi_partial_write_no_flush.bin');
+      const sqesBeforeA1 = uringFs.getRingStats().totalSqesPrepared;
+      native.setFaultInjection({ nextWriteShortBytes: 5 });
+      await uringFs.writeFile(partialNoFlush, payload32, { flush: false });
+      const sqesAfterA1 = uringFs.getRingStats().totalSqesPrepared;
+      assert.deepEqual(fs.readFileSync(partialNoFlush), payload32);
+      assert.equal(uringFs.getRingStats().directFdsInUse, slotsBeforeAll);
+      assert.ok(sqesAfterA1 - sqesBeforeA1 >= 6, `Expected >= 6 SQEs for partial write continuation, got ${sqesAfterA1 - sqesBeforeA1}`);
+
+      // A2. flush: true
+      const partialFlush = path.join(tmpDir, 'fi_partial_write_flush.bin');
+      const sqesBeforeA2 = uringFs.getRingStats().totalSqesPrepared;
+      native.setFaultInjection({ nextWriteShortBytes: 5 });
+      await uringFs.writeFile(partialFlush, payload32, { flush: true });
+      const sqesAfterA2 = uringFs.getRingStats().totalSqesPrepared;
+      assert.deepEqual(fs.readFileSync(partialFlush), payload32);
+      assert.equal(uringFs.getRingStats().directFdsInUse, slotsBeforeAll);
+      assert.ok(sqesAfterA2 - sqesBeforeA2 >= 8, `Expected >= 8 SQEs for flushed partial write continuation, got ${sqesAfterA2 - sqesBeforeA2}`);
+
+      // A3. Explicit O_SYNC flag (O_WRONLY | O_CREAT | O_TRUNC | O_SYNC) and 'rs+' (O_RDWR | O_SYNC)
+      const partialOsync = path.join(tmpDir, 'fi_partial_write_osync.bin');
+      native.setFaultInjection({ nextWriteShortBytes: 5 });
+      await uringFs.writeFile(partialOsync, payload32, {
+        flag: fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_SYNC,
+      });
+      assert.deepEqual(fs.readFileSync(partialOsync), payload32);
+      assert.equal(uringFs.getRingStats().directFdsInUse, slotsBeforeAll);
+
+      const partialRsPlus = path.join(tmpDir, 'fi_partial_write_rs_plus.bin');
+      fs.writeFileSync(partialRsPlus, '');
+      native.setFaultInjection({ nextWriteShortBytes: 5 });
+      await uringFs.writeFile(partialRsPlus, payload32, { flag: 'rs+' });
+      assert.deepEqual(fs.readFileSync(partialRsPlus), payload32);
+      assert.equal(uringFs.getRingStats().directFdsInUse, slotsBeforeAll);
+
+      // A4. 'as' flag (O_APPEND | O_SYNC): real kernel write wrote 32 bytes, continuation appends remaining 27 bytes at EOF without leaking slots
+      const partialAs = path.join(tmpDir, 'fi_partial_write_as.bin');
+      native.setFaultInjection({ nextWriteShortBytes: 5 });
+      await uringFs.writeFile(partialAs, payload32, { flag: 'as' });
+      const asDisk = fs.readFileSync(partialAs);
+      assert.deepEqual(asDisk, Buffer.concat([payload32, payload32.subarray(5)]));
+      assert.equal(uringFs.getRingStats().directFdsInUse, slotsBeforeAll);
+
+      // B. OP_WRITE_FILE Zero-Byte Write Return (res == 0 with size > 0 -> EIO, no infinite loop)
+      for (const writeOpts of [{ flush: false }, { flush: true }, { flag: 'as' }]) {
+        const zeroWriteFile = path.join(tmpDir, `fi_write_zero_${writeOpts.flag || writeOpts.flush}.bin`);
+        native.setFaultInjection({ nextWriteZero: true });
+        await assert.rejects(
+          () => uringFs.writeFile(zeroWriteFile, payload32, writeOpts),
+          (err) => err && err.code === 'EIO' && err.syscall === 'write'
+        );
+        assert.equal(uringFs.getRingStats().directFdsInUse, slotsBeforeAll);
+      }
+
+      // C. Linked CQE 1 -ECANCELED (125) and -EAGAIN (11) Retries across all linked operations
+      const retrySrcFile = path.join(tmpDir, 'fi_retry_src.bin');
+      const retryPayload = Buffer.from('FAULT_INJECTION_RETRY_PAYLOAD_0123456789_ABCDEFGHIJKLMNOPQRSTUVWXYZ');
+      await uringFs.writeFile(retrySrcFile, retryPayload);
+
+      for (const errCode of [125 /* ECANCELED */, 11 /* EAGAIN */]) {
+        // C1. readFile (Optimistic Pair 1 — must NOT return empty 0-byte Buffer!)
+        native.setFaultInjection({ nextCqe1Errno: errCode });
+        const rfBuf = await uringFs.readFile(retrySrcFile);
+        assert.equal(rfBuf.length, retryPayload.length, `readFile CQE1 errno=${errCode} must not return 0-byte buffer`);
+        assert.deepEqual(rfBuf, retryPayload);
+        assert.equal(uringFs.getRingStats().directFdsInUse, slotsBeforeAll);
+
+        // C2. readAt
+        const sqesBeforeReadAt = uringFs.getRingStats().totalSqesPrepared;
+        native.setFaultInjection({ nextCqe1Errno: errCode });
+        const raBuf = await uringFs.readAt(retrySrcFile, 6, 9);
+        assert.equal(raBuf.toString('utf8'), 'INJECTION');
+        assert.ok(uringFs.getRingStats().totalSqesPrepared - sqesBeforeReadAt >= 6);
+        assert.equal(uringFs.getRingStats().directFdsInUse, slotsBeforeAll);
+
+        // C3. readBatchAt
+        const sqesBeforeBatch = uringFs.getRingStats().totalSqesPrepared;
+        native.setFaultInjection({ nextCqe1Errno: errCode });
+        const rbArr = await uringFs.readBatchAt(retrySrcFile, [[0, 5], [16, 5], [30, 10]]);
+        assert.deepEqual(rbArr.map((b) => b.toString('utf8')), ['FAULT', 'RETRY', '0123456789']);
+        assert.ok(uringFs.getRingStats().totalSqesPrepared - sqesBeforeBatch >= 10);
+        assert.equal(uringFs.getRingStats().directFdsInUse, slotsBeforeAll);
+
+        // C4. fsync (HandleLinkedSimpleOp — must retry, NOT swallow error)
+        const sqesBeforeFsync = uringFs.getRingStats().totalSqesPrepared;
+        native.setFaultInjection({ nextCqe1Errno: errCode });
+        await uringFs.fsync(retrySrcFile);
+        assert.equal(uringFs.getRingStats().totalSqesPrepared - sqesBeforeFsync, 6);
+        assert.equal(uringFs.getRingStats().directFdsInUse, slotsBeforeAll);
+
+        // C5. fdatasync (HandleLinkedSimpleOp)
+        const sqesBeforeFdatasync = uringFs.getRingStats().totalSqesPrepared;
+        native.setFaultInjection({ nextCqe1Errno: errCode });
+        await uringFs.fdatasync(retrySrcFile);
+        assert.equal(uringFs.getRingStats().totalSqesPrepared - sqesBeforeFdatasync, 6);
+        assert.equal(uringFs.getRingStats().directFdsInUse, slotsBeforeAll);
+
+        // C6. readv (HandleLinkedSimpleOp)
+        const rv1 = Buffer.alloc(5);
+        const rv2 = Buffer.alloc(9);
+        const sqesBeforeReadv = uringFs.getRingStats().totalSqesPrepared;
+        native.setFaultInjection({ nextCqe1Errno: errCode });
+        const rvRes = await uringFs.readv(retrySrcFile, [rv1, rv2], 0);
+        assert.equal(rvRes.bytesRead, 14);
+        assert.equal(Buffer.concat([rv1, rv2]).toString('utf8'), 'FAULT_INJECTIO');
+        assert.equal(uringFs.getRingStats().totalSqesPrepared - sqesBeforeReadv, 6);
+        assert.equal(uringFs.getRingStats().directFdsInUse, slotsBeforeAll);
+
+        // C7. writev (HandleLinkedSimpleOp — flush: false and flush: true)
+        const wvFile = path.join(tmpDir, `fi_retry_writev_${errCode}.bin`);
+        const sqesBeforeWritev = uringFs.getRingStats().totalSqesPrepared;
+        native.setFaultInjection({ nextCqe1Errno: errCode });
+        const wvRes = await uringFs.writev(wvFile, [Buffer.from('HELLO_'), Buffer.from('WORLD')], 0, { flush: true });
+        assert.equal(wvRes.bytesWritten, 11);
+        assert.equal(fs.readFileSync(wvFile, 'utf8'), 'HELLO_WORLD');
+        assert.equal(uringFs.getRingStats().totalSqesPrepared - sqesBeforeWritev, 8);
+        assert.equal(uringFs.getRingStats().directFdsInUse, slotsBeforeAll);
+
+        // C8. fallocate (HandleLinkedSimpleOp)
+        const fallocFile = path.join(tmpDir, `fi_retry_falloc_${errCode}.bin`);
+        const sqesBeforeFalloc = uringFs.getRingStats().totalSqesPrepared;
+        native.setFaultInjection({ nextCqe1Errno: errCode });
+        await uringFs.fallocate(fallocFile, 0, 256);
+        assert.equal(fs.statSync(fallocFile).size, 256);
+        assert.equal(uringFs.getRingStats().totalSqesPrepared - sqesBeforeFalloc, 6);
+        assert.equal(uringFs.getRingStats().directFdsInUse, slotsBeforeAll);
+
+        // C9. fadvise (HandleLinkedSimpleOp)
+        const sqesBeforeFadvise = uringFs.getRingStats().totalSqesPrepared;
+        native.setFaultInjection({ nextCqe1Errno: errCode });
+        await uringFs.fadvise(retrySrcFile, 0, retryPayload.length, uringFs.POSIX_FADV_SEQUENTIAL);
+        assert.equal(uringFs.getRingStats().totalSqesPrepared - sqesBeforeFadvise, 6);
+        assert.equal(uringFs.getRingStats().directFdsInUse, slotsBeforeAll);
+      }
+
+      // D. OP_READ_FILE Pair 2 Short-Read Continuation (128 KB file, optimistic 64 KB overflow -> STATX -> Pair 2 clamped to 4096 -> continuation)
+      const pair2File = path.join(tmpDir, 'fi_pair2_128k.bin');
+      const pair2Data = crypto.randomBytes(128 * 1024);
+      await uringFs.writeFile(pair2File, pair2Data);
+
+      const sqesBeforePair2 = uringFs.getRingStats().totalSqesPrepared;
+      native.setFaultInjection({ nextPair2ShortBytes: 4096 });
+      const pair2Read = await uringFs.readFile(pair2File);
+      const sqesAfterPair2 = uringFs.getRingStats().totalSqesPrepared;
+
+      assert.equal(pair2Read.length, pair2Data.length, '128 KB Pair 2 short-read continuation must not truncate');
+      assert.equal(Buffer.compare(pair2Read, pair2Data), 0, '128 KB Pair 2 short-read continuation must match byte-for-byte');
+      assert.ok(sqesAfterPair2 - sqesBeforePair2 >= 8, `Expected >= 8 SQEs for Pair 1 + STATX + Pair 2 + continuation, got ${sqesAfterPair2 - sqesBeforePair2}`);
+      assert.equal(uringFs.getRingStats().directFdsInUse, slotsBeforeAll);
+
+      // E. Short-Read Continuation in HandleLinkedReadAt (readAt) and OP_FH_READ_AT (fh.readAt)
+      const shortReadAtFile = path.join(tmpDir, 'fi_short_read_at.bin');
+      const shortReadAtPayload = Buffer.from('0123456789ABCDEFGHIJ'); // 20 bytes
+      assert.equal(shortReadAtPayload.length, 20);
+      await uringFs.writeFile(shortReadAtFile, shortReadAtPayload);
+
+      const sqesBeforeReadAtShort = uringFs.getRingStats().totalSqesPrepared;
+      const fiResReadAt = native.setFaultInjection({ nextReadAtShortBytes: 5 });
+      assert.equal(fiResReadAt.nextReadAtShortBytes, 5);
+      const readAtShortBuf = await uringFs.readAt(shortReadAtFile, 0, 20);
+      assert.deepEqual(readAtShortBuf, shortReadAtPayload, 'readAt short-read continuation must return all 20 bytes intact');
+      assert.ok(
+        uringFs.getRingStats().totalSqesPrepared - sqesBeforeReadAtShort >= 6,
+        'readAt short-read continuation must transition to unlinked continuation'
+      );
+      assert.equal(uringFs.getRingStats().directFdsInUse, slotsBeforeAll);
+
+      // Verify readAt reading past EOF with fault-injected short read stops cleanly at EOF (20 bytes)
+      native.setFaultInjection({ nextReadAtShortBytes: 5 });
+      const readAtPastEof = await uringFs.readAt(shortReadAtFile, 0, 30);
+      assert.deepEqual(readAtPastEof, shortReadAtPayload);
+      assert.equal(uringFs.getRingStats().directFdsInUse, slotsBeforeAll);
+
+      // Verify OP_FH_READ_AT (fh.readAt) short-read continuation
+      const fhShort = await uringFs.open(shortReadAtFile, 'r');
+      try {
+        const sqesBeforeFhShort = uringFs.getRingStats().totalSqesPrepared;
+        native.setFaultInjection({ nextReadAtShortBytes: 5 });
+        const fhShortBuf = await fhShort.readAt(0, 20);
+        assert.deepEqual(fhShortBuf, shortReadAtPayload, 'fh.readAt short-read continuation must return all 20 bytes intact');
+        assert.equal(
+          uringFs.getRingStats().totalSqesPrepared - sqesBeforeFhShort,
+          2,
+          'fh.readAt short-read continuation must schedule 2 read SQEs'
+        );
+
+        // Verify fh.readAt reading past EOF with fault-injected short read stops cleanly at EOF (20 bytes)
+        native.setFaultInjection({ nextReadAtShortBytes: 5 });
+        const fhPastEof = await fhShort.readAt(0, 30);
+        assert.deepEqual(fhPastEof, shortReadAtPayload);
+      } finally {
+        await fhShort.close();
+      }
+      assert.equal(uringFs.getRingStats().directFdsInUse, slotsBeforeAll);
+    } finally {
+      native.setFaultInjection({});
+    }
   });
 
   test('29. Comprehensive JS Line & Branch Coverage across lib/*.js modules', async () => {
@@ -2908,7 +3194,9 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     );
   });
 
-  test('31. Round 4: Native io_uring Caller Stack Traces (err.stack) and Worker AbortSignal Safety', async () => {
+  test('31. Round 4: Native io_uring Caller Stack Traces (err.stack) and In-Flight CleanupModule Safety', async () => {
+    const { spawnSync } = require('node:child_process');
+
     // A. Caller stack frames on native io_uring rejections
     const missingPath = path.join(tmpDir, 'definitely_missing_round4.txt');
     async function invokeReadFileMissing() {
@@ -2969,6 +3257,27 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
         return true;
       }
     );
+
+    // B. CleanupModule safely deletes in-flight & overflow-queued IORequest* instances on env teardown
+    const cleanupTarget = path.join(tmpDir, 'round4_cleanup.txt');
+    await uringFs.writeFile(cleanupTarget, 'cleanup-payload');
+    const cleanupRes = spawnSync(
+      process.execPath,
+      [
+        '-e',
+        `const u = require('./index.js');
+         const p = ${JSON.stringify(cleanupTarget)};
+         for (let i = 0; i < 600; i++) {
+           u.readFile(p).catch(() => {});
+         }
+         process.exit(0);`,
+      ],
+      {
+        cwd: path.join(__dirname, '..'),
+        encoding: 'utf8',
+      }
+    );
+    assert.equal(cleanupRes.status, 0, `CleanupModule subprocess failed: ${cleanupRes.stderr}`);
 
     // C. rmdir with fallback: 'worker' and live AbortSignal (no DataCloneError)
     const workerRmdirDir = path.join(tmpDir, 'round4_worker_rmdir_signal');

@@ -16,7 +16,7 @@
           "sources": [ "src/addon.cc" ],
           "libraries": [ "-Wl,-Bstatic", "-luring", "-Wl,-Bdynamic" ],
           "ldflags": [ "-Wl,--exclude-libs,ALL" ],
-          "cflags_cc": [ "-std=c++17", "-O3", "-Wall", "-Wextra", "-Wno-unused-parameter", "-fvisibility=hidden" ],
+          "cflags_cc": [ "-std=c++17", "-O3", "-Wall", "-Wextra", "-Wconversion", "-Wsign-conversion", "-Wshadow", "-Wformat=2", "-Wundef", "-fvisibility=hidden" ],
           "conditions": [
             ["march_native=='true'", {
               "cflags_cc": [ "-march=native", "-mtune=native" ]
@@ -26,7 +26,7 @@
         ["OS=='linux' and has_liburing=='true' and has_static_liburing!='true'", {
           "sources": [ "src/addon.cc" ],
           "libraries": [ "-luring" ],
-          "cflags_cc": [ "-std=c++17", "-O3", "-Wall", "-Wextra", "-Wno-unused-parameter", "-fvisibility=hidden" ],
+          "cflags_cc": [ "-std=c++17", "-O3", "-Wall", "-Wextra", "-Wconversion", "-Wsign-conversion", "-Wshadow", "-Wformat=2", "-Wundef", "-fvisibility=hidden" ],
           "conditions": [
             ["march_native=='true'", {
               "cflags_cc": [ "-march=native", "-mtune=native" ]
@@ -35,7 +35,7 @@
         }],
         ["OS!='linux' or has_liburing!='true'", {
           "sources": [ "src/addon_stub.cc" ],
-          "cflags_cc": [ "-std=c++17", "-O2" ]
+          "cflags_cc": [ "-std=c++17", "-O2", "-Wall", "-Wextra", "-Wconversion", "-Wsign-conversion", "-Wshadow", "-Wformat=2", "-Wundef", "-fvisibility=hidden" ]
         }]
       ]
     }
