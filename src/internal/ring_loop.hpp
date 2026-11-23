@@ -134,6 +134,11 @@ static void ProcessCompletions() {
     finished_requests.reserve(128);
     int passes = 0;
 
+    if (RingHasCqOverflow(&ring)) {
+        stats.cq_overflows++;
+        (void)io_uring_get_events(&ring);
+    }
+
     while (io_uring_cq_ready(&ring) > 0 && passes < 64) {
         passes++;
         struct io_uring_cqe* cqe;
@@ -147,6 +152,11 @@ static void ProcessCompletions() {
 
             uint64_t raw_data = io_uring_cqe_get_data64(cqe);
             if (raw_data == 0) continue;
+            if (raw_data == PROBE_SENTINEL_DATA) {
+                probe_last_res = cqe->res;
+                probe_pending = false;
+                continue;
+            }
             if (raw_data & 1ULL) {
                 FreeDirectSlot(static_cast<int>(raw_data >> 1));
                 continue;
@@ -204,6 +214,10 @@ static void ProcessCompletions() {
         if (unadvanced_cqes > 0) {
             io_uring_cq_advance(&ring, unadvanced_cqes);
             unadvanced_cqes = 0;
+        }
+        if (RingHasCqOverflow(&ring)) {
+            stats.cq_overflows++;
+            (void)io_uring_get_events(&ring);
         }
         DrainPendingQueue();
         FlushSubmissions();

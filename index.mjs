@@ -41,6 +41,8 @@ export const {
   getActiveBackend,
   getUnsupportedReason,
   getRingStats,
+  probeRingRestriction,
+  getRingStatus,
   configure,
   setOptimisticReadSize,
   closeFallbackWorkers,

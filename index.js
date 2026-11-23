@@ -35,6 +35,8 @@ const {
   getActiveBackend,
   getUnsupportedReason,
   getRingStats,
+  probeRingRestriction,
+  getRingStatus,
 } = require('./lib/backend');
 const { UringFileHandle } = require('./lib/file_handle');
 const {
@@ -108,6 +110,8 @@ module.exports = {
   getActiveBackend,
   getUnsupportedReason,
   getRingStats,
+  probeRingRestriction,
+  getRingStatus,
   configure,
   setOptimisticReadSize,
   closeFallbackWorkers,

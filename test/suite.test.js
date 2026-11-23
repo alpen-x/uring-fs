@@ -3286,4 +3286,142 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     await uringFs.rmdir(workerRmdirDir, { fallback: 'worker', signal: liveAc.signal });
     assert.equal(await uringFs.exists(workerRmdirDir), false);
   });
+
+  test('32. v1.3.4 Kernel Opcode Restrictions (IORING_REGISTER_RESTRICTIONS), CQSIZE 4x, getRingStatus, and Intrusive/RAII Engine Verification', async () => {
+    const { spawnSync } = require('node:child_process');
+
+    // A. Ring stats & restriction probe telemetry
+    const stats = uringFs.getRingStats();
+    assert.equal(typeof stats.restrictionsSupported, 'boolean');
+    assert.equal(typeof stats.allowedOpcodesCount, 'number');
+    assert.equal(typeof stats.cqSize, 'number');
+    assert.equal(typeof stats.cqOverflows, 'number');
+    assert.ok(stats.cqOverflows >= 0);
+
+    const probe = uringFs.probeRingRestriction();
+    if (uringFs.isUringSupported()) {
+      assert.equal(stats.restrictionsSupported, true);
+      assert.equal(stats.allowedOpcodesCount, 22);
+      assert.ok(stats.cqSize >= stats.queueDepth, `Expected cqSize (${stats.cqSize}) >= queueDepth (${stats.queueDepth})`);
+      assert.equal(stats.cqSize, stats.queueDepth * 4);
+      assert.deepEqual(probe, { restricted: true, blockedSocketErrno: -13 });
+    } else {
+      assert.equal(stats.restrictionsSupported, false);
+      assert.equal(stats.allowedOpcodesCount, 0);
+      assert.equal(stats.cqSize, 0);
+      assert.equal(stats.cqOverflows, 0);
+      assert.deepEqual(probe, { restricted: false, blockedSocketErrno: -38 });
+    }
+
+    // B. getRingStatus() and ESM export parity
+    const status = uringFs.getRingStatus();
+    assert.deepEqual(status, {
+      activeBackend: uringFs.getActiveBackend(),
+      isUringSupported: uringFs.isUringSupported(),
+      fallbackReason: uringFs.getUnsupportedReason(),
+      restrictionsSupported: stats.restrictionsSupported,
+      allowedOpcodesCount: stats.allowedOpcodesCount,
+      queueDepth: stats.queueDepth,
+      cqSize: stats.cqSize,
+      optimisticReadSize: stats.optimisticReadSize,
+    });
+
+    const esm = await import('../index.mjs');
+    assert.equal(typeof esm.probeRingRestriction, 'function');
+    assert.equal(typeof esm.getRingStatus, 'function');
+
+    // C. configure({ restrictions }) toggle & TypeError validation
+    assert.throws(
+      () => uringFs.configure({ restrictions: 'bad' }),
+      (err) => err instanceof TypeError && err.code === 'ERR_INVALID_ARG_TYPE'
+    );
+
+    try {
+      const cfgOff = uringFs.configure({ restrictions: false });
+      assert.equal(cfgOff.restrictions, false);
+      assert.deepEqual(uringFs.probeRingRestriction(), { restricted: false, blockedSocketErrno: -38 });
+
+      const cfgOn = uringFs.configure({ restrictions: true });
+      assert.equal(cfgOn.restrictions, true);
+      if (uringFs.isUringSupported()) {
+        assert.deepEqual(uringFs.probeRingRestriction(), { restricted: true, blockedSocketErrno: -13 });
+      }
+    } finally {
+      uringFs.configure({ restrictions: process.env.URING_FS_RESTRICTIONS !== '0' });
+    }
+
+    // D. URING_FS_RESTRICTIONS=0 child process override
+    const childFile = path.join(tmpDir, 'v134_no_restrictions.txt');
+    const childRes = spawnSync(
+      process.execPath,
+      [
+        '-e',
+        `const assert = require('node:assert/strict');
+         const u = require('./index.js');
+         (async () => {
+           const st = u.getRingStats();
+           assert.equal(st.restrictionsSupported, false);
+           assert.equal(st.allowedOpcodesCount, 0);
+           assert.equal(u.probeRingRestriction().restricted, false);
+           await u.writeFile(${JSON.stringify(childFile)}, 'unrestricted-ok');
+           assert.equal(await u.readFile(${JSON.stringify(childFile)}, 'utf8'), 'unrestricted-ok');
+         })().catch((err) => { console.error(err); process.exit(1); });`,
+      ],
+      {
+        cwd: path.join(__dirname, '..'),
+        env: { ...process.env, URING_FS_RESTRICTIONS: '0' },
+        encoding: 'utf8',
+      }
+    );
+    assert.equal(childRes.status, 0, `URING_FS_RESTRICTIONS=0 subprocess failed: ${childRes.stderr}`);
+
+    // E. Intrusive live_requests_head teardown & RAII DirectSlotTable / OptimisticBufferPool verification
+    const poolFile = path.join(tmpDir, 'v134_raii_pool.txt');
+    await uringFs.writeFile(poolFile, 'raii-buffer-pool-test-payload');
+    const prevOptSize = uringFs.getRingStats().optimisticReadSize;
+    try {
+      uringFs.setOptimisticReadSize(4096);
+      await Promise.all(Array.from({ length: 32 }, () => uringFs.readFile(poolFile, 'utf8')));
+      uringFs.setOptimisticReadSize(8192);
+      const reads = await Promise.all(Array.from({ length: 32 }, () => uringFs.readFile(poolFile, 'utf8')));
+      for (const content of reads) {
+        assert.equal(content, 'raii-buffer-pool-test-payload');
+      }
+    } finally {
+      uringFs.setOptimisticReadSize(prevOptSize);
+    }
+
+    // Concurrent probe while requests are in-flight
+    const inflightReads = Promise.all(Array.from({ length: 16 }, () => uringFs.readFile(poolFile, 'utf8')));
+    const concurrentProbe = uringFs.probeRingRestriction();
+    await inflightReads;
+    if (uringFs.isUringSupported()) {
+      assert.deepEqual(concurrentProbe, { restricted: true, blockedSocketErrno: -13 });
+    } else {
+      assert.deepEqual(concurrentProbe, { restricted: false, blockedSocketErrno: -38 });
+    }
+
+    const postStats = uringFs.getRingStats();
+    assert.equal(postStats.activeRequests, 0);
+    assert.equal(postStats.directFdsInUse, 0);
+
+    // Intrusive live_requests_head CleanupModule teardown with queued requests
+    const intrusiveChild = spawnSync(
+      process.execPath,
+      [
+        '-e',
+        `const u = require('./index.js');
+         const p = ${JSON.stringify(poolFile)};
+         for (let i = 0; i < 800; i++) {
+           u.readFile(p).catch(() => {});
+         }
+         process.exit(0);`,
+      ],
+      {
+        cwd: path.join(__dirname, '..'),
+        encoding: 'utf8',
+      }
+    );
+    assert.equal(intrusiveChild.status, 0, `Intrusive CleanupModule subprocess failed: ${intrusiveChild.stderr}`);
+  });
 });

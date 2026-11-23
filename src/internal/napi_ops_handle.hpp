@@ -55,7 +55,7 @@ Napi::Value OpenHandleUring(const Napi::CallbackInfo& info) {
     req->open_flags = openFlags;
     req->mode = mode;
 
-    if (direct_fds_supported && direct_fd_free_list.size() > MAX_HANDLE_DIRECT_SLOTS) {
+    if (direct_slots.supported && direct_slots.FreeCount() > MAX_HANDLE_DIRECT_SLOTS) {
         int slot = AllocateDirectSlot();
         if (slot >= 0) {
             req->direct_slot = slot;

@@ -109,7 +109,7 @@ static inline void HandleLinkedWriteFile(
             ScheduleStage(req);
         } else {
             req->open_flags = O_WRONLY | (req->open_flags & (O_APPEND | O_SYNC | O_DSYNC));
-            int next_slot = direct_fds_supported ? AllocateDirectSlot() : -1;
+            int next_slot = direct_slots.supported ? AllocateDirectSlot() : -1;
             if (next_slot >= 0) {
                 FreeDirectSlot(req->direct_slot);
                 req->direct_slot = next_slot;

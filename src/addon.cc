@@ -73,6 +73,94 @@ Napi::Value SetFaultInjection(const Napi::CallbackInfo& info) {
     return out;
 }
 
+Napi::Value SetRestrictionsConfig(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsBoolean()) {
+        Napi::TypeError::New(env, "Expected a boolean for setRestrictionsConfig").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    restrictions_enabled_config = info[0].As<Napi::Boolean>().Value();
+    return Napi::Boolean::New(env, restrictions_enabled_config);
+}
+
+Napi::Value ProbeDisallowedOpcode(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    Napi::Object out = Napi::Object::New(env);
+    if (!ring_supported) {
+        out.Set("restricted", Napi::Boolean::New(env, false));
+        out.Set("blockedSocketErrno", Napi::Number::New(env, -ENOSYS));
+        return out;
+    }
+
+    if (unsubmitted_sqes > 0) {
+        FlushSubmissions();
+    }
+
+    static constexpr uint8_t PROBE_OP_SOCKET = 45;
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+        out.Set("restricted", Napi::Boolean::New(env, false));
+        out.Set("blockedSocketErrno", Napi::Number::New(env, -EAGAIN));
+        return out;
+    }
+
+    io_uring_prep_rw(PROBE_OP_SOCKET, sqe, AF_UNSPEC, nullptr, static_cast<unsigned>(0), static_cast<__u64>(SOCK_STREAM));
+
+    int res = -EIO;
+    if (in_flight_sqes == 0 && io_uring_cq_ready(&ring) == 0) {
+        io_uring_sqe_set_data64(sqe, 0ULL);
+        int sub_ret = io_uring_submit_and_wait(&ring, 1);
+        if (sub_ret < 0) {
+            out.Set("restricted", Napi::Boolean::New(env, false));
+            out.Set("blockedSocketErrno", Napi::Number::New(env, sub_ret));
+            return out;
+        }
+        struct io_uring_cqe* cqe = nullptr;
+        int wait_ret = io_uring_wait_cqe(&ring, &cqe);
+        if (wait_ret == 0 && cqe != nullptr) {
+            res = cqe->res;
+            io_uring_cqe_seen(&ring, cqe);
+        } else if (wait_ret < 0) {
+            res = wait_ret;
+        }
+    } else {
+        probe_pending = true;
+        probe_last_res = -EIO;
+        io_uring_sqe_set_data64(sqe, PROBE_SENTINEL_DATA);
+        in_flight_sqes++;
+        int sub_ret = io_uring_submit_and_wait(&ring, 1);
+        if (sub_ret < 0) {
+            probe_pending = false;
+            if (in_flight_sqes > 0) in_flight_sqes--;
+            out.Set("restricted", Napi::Boolean::New(env, false));
+            out.Set("blockedSocketErrno", Napi::Number::New(env, sub_ret));
+            return out;
+        }
+        bool prev_in_poll = in_poll_callback;
+        in_poll_callback = false;
+        for (int tries = 0; tries < 1024 && probe_pending; ++tries) {
+            ProcessCompletions();
+            if (probe_pending) {
+                struct io_uring_cqe* wait_cqe = nullptr;
+                int wret = io_uring_wait_cqe(&ring, &wait_cqe);
+                if (wret < 0 && wret != -EINTR) {
+                    break;
+                }
+            }
+        }
+        in_poll_callback = prev_in_poll;
+        if (probe_pending) {
+            probe_pending = false;
+        } else {
+            res = probe_last_res;
+        }
+    }
+
+    out.Set("restricted", Napi::Boolean::New(env, res == -EACCES));
+    out.Set("blockedSocketErrno", Napi::Number::New(env, res));
+    return out;
+}
+
 Napi::Value GetRingStats(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     Napi::Object obj = Napi::Object::New(env);
@@ -89,9 +177,13 @@ Napi::Value GetRingStats(const Napi::CallbackInfo& info) {
     obj.Set("overflowQueued", Napi::Number::New(env, static_cast<double>(stats.overflow_queued)));
     obj.Set("credentialResets", Napi::Number::New(env, static_cast<double>(stats.credential_resets)));
     obj.Set("optimisticReadSize", Napi::Number::New(env, static_cast<double>(default_optimistic_read_size)));
-    obj.Set("directFdsSupported", Napi::Boolean::New(env, direct_fds_supported));
+    obj.Set("directFdsSupported", Napi::Boolean::New(env, direct_slots.supported));
     obj.Set("directFdTableSize", Napi::Number::New(env, DIRECT_FD_TABLE_SIZE));
-    obj.Set("directFdsInUse", Napi::Number::New(env, direct_fds_supported ? static_cast<double>(DIRECT_FD_TABLE_SIZE - direct_fd_free_list.size()) : 0.0));
+    obj.Set("directFdsInUse", Napi::Number::New(env, static_cast<double>(direct_slots.InUse())));
+    obj.Set("restrictionsSupported", Napi::Boolean::New(env, ring_restrictions_supported));
+    obj.Set("allowedOpcodesCount", Napi::Number::New(env, restricted_opcodes_count));
+    obj.Set("cqSize", Napi::Number::New(env, (ring_supported && ring.cq.kring_entries) ? static_cast<double>(*ring.cq.kring_entries) : 0.0));
+    obj.Set("cqOverflows", Napi::Number::New(env, static_cast<double>(stats.cq_overflows)));
     return obj;
 }
 
@@ -105,11 +197,8 @@ static void CleanupModule(void* arg) {
     }
     pending_pair2_queue.clear();
     pending_queue.clear();
-    if (!live_requests.empty()) {
-        std::vector<IORequest*> remaining(live_requests.begin(), live_requests.end());
-        for (IORequest* req : remaining) {
-            delete req;
-        }
+    while (live_requests_head != nullptr) {
+        delete live_requests_head;
     }
     if (async_context != nullptr && arg != nullptr) {
         napi_async_destroy(static_cast<napi_env>(arg), async_context);
@@ -119,11 +208,12 @@ static void CleanupModule(void* arg) {
     in_flight_sqes = 0;
     unsubmitted_sqes = 0;
     unadvanced_cqes = 0;
+    probe_pending = false;
     fault_injection = FaultInjectionConfig{};
-    ClearOptimisticBufferPool();
-    direct_fd_free_list.clear();
-    for (int i = 0; i < DIRECT_FD_TABLE_SIZE; ++i) direct_slot_allocated[i] = false;
-    direct_fds_supported = false;
+    optimistic_pool.Clear();
+    direct_slots.Reset();
+    ring_restrictions_supported = false;
+    restricted_opcodes_count = 0;
     if (ring_supported) {
         io_uring_queue_exit(&ring);
         ring_supported = false;
@@ -135,11 +225,16 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
 #ifdef __GLIBC__
         mallopt(M_MMAP_THRESHOLD, 4 * 1024 * 1024);
 #endif
+        const char* env_restr = std::getenv("URING_FS_RESTRICTIONS");
+        if (env_restr != nullptr && std::strcmp(env_restr, "0") == 0) {
+            restrictions_enabled_config = false;
+        }
+
         uint32_t depth = DEFAULT_QUEUE_DEPTH;
-        int ret = InitRingWithBestFlags(depth, &ring);
+        int ret = InitRingWithRestrictionsAndBestFlags(depth, &ring);
         if (ret < 0) {
             depth = FALLBACK_QUEUE_DEPTH;
-            ret = InitRingWithBestFlags(depth, &ring);
+            ret = InitRingWithRestrictionsAndBestFlags(depth, &ring);
         }
 
         if (ret < 0) {
@@ -150,8 +245,6 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
             stats.queue_depth = depth;
             ring_euid = geteuid();
             ring_egid = getegid();
-
-            InitDirectFdTable();
 
             uv_loop_t* loop;
             napi_get_uv_event_loop(env, &loop);
@@ -213,6 +306,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("getUnsupportedReason", Napi::Function::New(env, GetUnsupportedReason));
     exports.Set("getRingStats", Napi::Function::New(env, GetRingStats));
     exports.Set("setFaultInjection", Napi::Function::New(env, SetFaultInjection));
+    exports.Set("probeDisallowedOpcode", Napi::Function::New(env, ProbeDisallowedOpcode));
+    exports.Set("setRestrictionsConfig", Napi::Function::New(env, SetRestrictionsConfig));
     return exports;
 }
 
