@@ -79,8 +79,14 @@ Napi::Value SetRestrictionsConfig(const Napi::CallbackInfo& info) {
         Napi::TypeError::New(env, "Expected a boolean for setRestrictionsConfig").ThrowAsJavaScriptException();
         return env.Null();
     }
-    restrictions_enabled_config = info[0].As<Napi::Boolean>().Value();
-    return Napi::Boolean::New(env, restrictions_enabled_config);
+    bool next_val = info[0].As<Napi::Boolean>().Value();
+    if (restrictions_enabled_config != next_val || (ring_supported && ring_restrictions_supported != next_val)) {
+        restrictions_enabled_config = next_val;
+        if (ring_supported) {
+            ReinitIdleRing(false);
+        }
+    }
+    return Napi::Boolean::New(env, ring_restrictions_supported);
 }
 
 Napi::Value ProbeDisallowedOpcode(const Napi::CallbackInfo& info) {
@@ -195,6 +201,10 @@ static void CleanupModule(void* arg) {
         ClosePollHandle();
         handles_initialized = false;
     }
+    if (ring_supported) {
+        io_uring_queue_exit(&ring);
+        ring_supported = false;
+    }
     pending_pair2_queue.clear();
     pending_queue.clear();
     while (live_requests_head != nullptr) {
@@ -214,10 +224,6 @@ static void CleanupModule(void* arg) {
     direct_slots.Reset();
     ring_restrictions_supported = false;
     restricted_opcodes_count = 0;
-    if (ring_supported) {
-        io_uring_queue_exit(&ring);
-        ring_supported = false;
-    }
 }
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {

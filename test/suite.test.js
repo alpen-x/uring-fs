@@ -3008,6 +3008,7 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
       const disabledBackend = require(backendPath);
       assert.equal(disabledBackend.getNative(), null);
       assert.match(disabledBackend.getUnsupportedReason(), /URING_FS_DISABLE_NATIVE=1/);
+      assert.deepEqual(disabledBackend.probeRingRestriction(), { restricted: false, blockedSocketErrno: -38 });
 
       process.env.URING_FS_DISABLE_NATIVE = 'stub';
       delete require.cache[backendPath];
@@ -3339,11 +3340,15 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     try {
       const cfgOff = uringFs.configure({ restrictions: false });
       assert.equal(cfgOff.restrictions, false);
-      assert.deepEqual(uringFs.probeRingRestriction(), { restricted: false, blockedSocketErrno: -38 });
+      assert.equal(uringFs.getRingStats().restrictionsSupported, false);
+      const probeOff = uringFs.probeRingRestriction();
+      assert.equal(probeOff.restricted, false);
+      assert.notEqual(probeOff.blockedSocketErrno, -13);
 
       const cfgOn = uringFs.configure({ restrictions: true });
       assert.equal(cfgOn.restrictions, true);
       if (uringFs.isUringSupported()) {
+        assert.equal(uringFs.getRingStats().restrictionsSupported, true);
         assert.deepEqual(uringFs.probeRingRestriction(), { restricted: true, blockedSocketErrno: -13 });
       }
     } finally {

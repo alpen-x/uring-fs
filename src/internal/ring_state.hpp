@@ -8,6 +8,13 @@ struct DirectSlotTable {
     std::vector<int> free_list;
     bool allocated[DIRECT_FD_TABLE_SIZE] = { false };
 
+    DirectSlotTable() = default;
+    ~DirectSlotTable() = default;
+    DirectSlotTable(const DirectSlotTable&) = delete;
+    DirectSlotTable& operator=(const DirectSlotTable&) = delete;
+    DirectSlotTable(DirectSlotTable&&) = delete;
+    DirectSlotTable& operator=(DirectSlotTable&&) = delete;
+
     inline void Reset() {
         supported = false;
         free_list.clear();
@@ -65,9 +72,14 @@ struct OptimisticBufferPool {
     std::vector<char*> buffers;
     size_t pooled_size = 0;
 
+    OptimisticBufferPool() = default;
     ~OptimisticBufferPool() {
         Clear();
     }
+    OptimisticBufferPool(const OptimisticBufferPool&) = delete;
+    OptimisticBufferPool& operator=(const OptimisticBufferPool&) = delete;
+    OptimisticBufferPool(OptimisticBufferPool&&) = delete;
+    OptimisticBufferPool& operator=(OptimisticBufferPool&&) = delete;
 
     inline void Clear() {
         for (char* buf : buffers) {
@@ -468,16 +480,10 @@ static void UnrefEventLoopIfIdle() {
     }
 }
 
-// Mitigates CVE-2024-22017: If the process changed UID/GID (e.g. via setuid/setgid) and no operations
-// or live direct-FD handles are active, tears down and re-initializes the io_uring instance.
-static bool EnsureCredentialsSafe() {
+// Safely tears down and re-initializes the io_uring instance if no operations or live direct-FD
+// handles are active. Used both for credential resets (CVE-2024-22017) and runtime configure({ restrictions }).
+static bool ReinitIdleRing(bool is_credential_reset = false) {
     if (!ring_supported) return false;
-
-    uid_t cur_uid = geteuid();
-    gid_t cur_gid = getegid();
-    if (cur_uid == ring_euid && cur_gid == ring_egid) {
-        return true;
-    }
 
     if (unsubmitted_sqes > 0) {
         FlushSubmissions();
@@ -497,16 +503,34 @@ static bool EnsureCredentialsSafe() {
         ring_restrictions_supported = false;
         restricted_opcodes_count = 0;
         direct_slots.Reset();
-        unsupported_reason = std::string("Failed to reinitialize io_uring after UID/GID change: ") + uv_strerror(ret);
+        if (is_credential_reset) {
+            unsupported_reason = std::string("Failed to reinitialize io_uring after UID/GID change: ") + uv_strerror(ret);
+        }
         return false;
     }
 
-    ring_euid = cur_uid;
-    ring_egid = cur_gid;
-    stats.credential_resets++;
+    ring_euid = geteuid();
+    ring_egid = getegid();
+    if (is_credential_reset) {
+        stats.credential_resets++;
+    }
 
     InitPollHandle(loop);
     return true;
+}
+
+// Mitigates CVE-2024-22017: If the process changed UID/GID (e.g. via setuid/setgid) and no operations
+// or live direct-FD handles are active, tears down and re-initializes the io_uring instance.
+static bool EnsureCredentialsSafe() {
+    if (!ring_supported) return false;
+
+    uid_t cur_uid = geteuid();
+    gid_t cur_gid = getegid();
+    if (cur_uid == ring_euid && cur_gid == ring_egid) {
+        return true;
+    }
+
+    return ReinitIdleRing(true);
 }
 
 #endif // URING_FS_INTERNAL_RING_STATE_HPP
