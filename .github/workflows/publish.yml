@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -132,13 +133,18 @@ jobs:
       - name: Run full test suite before publishing
         run: npm run check
 
-      - name: Publish package to npm (OIDC Trusted Publishing or NPM_TOKEN)
+      - name: Publish or Stage package to npm (OIDC Trusted Publishing or NPM_TOKEN)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          pkg_ver=$(node -p "require('./package.json').version")
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ "v${pkg_ver}" != "${GITHUB_REF_NAME:-}" ]; then
+            echo "Error: package.json version (${pkg_ver}) does not match git tag (${GITHUB_REF_NAME})"
+            exit 1
+          fi
           npm config delete always-auth || true
           if [ -z "$NODE_AUTH_TOKEN" ]; then
             unset NODE_AUTH_TOKEN
             npm config delete //registry.npmjs.org/:_authToken || true
           fi
-          npm publish --provenance --access public
+          npm publish --provenance --access public || npm stage publish --provenance --access public
