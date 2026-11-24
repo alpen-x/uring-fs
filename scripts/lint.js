@@ -92,7 +92,35 @@ async function main() {
     }
   }
 
-  // 3. C++ Warning & Static Check (g++ -Werror)
+  // 3. Verify Release Version Consistency & GitHub Actions OIDC Publish Invariants
+  const [pkgRaw, changelogSrc, publishYmlSrc] = await Promise.all([
+    uringFs.readFile(path.join(rootDir, 'package.json'), 'utf8'),
+    uringFs.readFile(path.join(rootDir, 'CHANGELOG.md'), 'utf8'),
+    uringFs.readFile(path.join(rootDir, '.github', 'workflows', 'publish.yml'), 'utf8'),
+  ]);
+  const pkg = JSON.parse(pkgRaw);
+  if (!changelogSrc.includes(`## [${pkg.version}]`)) {
+    fail(`CHANGELOG.md is missing entry for current package.json version "## [${pkg.version}]"`);
+  }
+  const branchRes = spawnSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: rootDir, encoding: 'utf8' });
+  if (branchRes.status === 0) {
+    const branchName = branchRes.stdout.trim();
+    const releaseMatch = /^release\/v(\d+\.\d+\.\d+)$/.exec(branchName);
+    if (releaseMatch && releaseMatch[1] !== pkg.version) {
+      fail(`Branch "${branchName}" version (${releaseMatch[1]}) does not match package.json version (${pkg.version})`);
+    }
+  }
+  if (!publishYmlSrc.includes('id-token: write')) {
+    fail('.github/workflows/publish.yml is missing "id-token: write" OIDC permission');
+  }
+  if (!publishYmlSrc.includes('npm install -g npm@')) {
+    fail('.github/workflows/publish.yml is missing global npm upgrade required for OIDC Trusted Publishing');
+  }
+  if (!publishYmlSrc.includes('npm publish --provenance --access public || npm stage publish --provenance --access public')) {
+    fail('.github/workflows/publish.yml is missing "|| npm stage publish --provenance --access public" OIDC fallback');
+  }
+
+  // 4. C++ Warning & Static Check (g++ -Werror)
   if (process.platform === 'linux') {
     const gppCheck = spawnSync('which', ['g++'], { encoding: 'utf8' });
     const [hasStdLiburing, hasLocalLiburing] = await Promise.all([

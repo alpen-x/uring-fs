@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <cerrno>
 #include <deque>
+#include <type_traits>
 #include <vector>
 #ifdef __GLIBC__
 #include <malloc.h>

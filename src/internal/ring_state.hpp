@@ -68,6 +68,14 @@ struct DirectSlotTable {
     }
 };
 
+static_assert(
+    !std::is_copy_constructible<DirectSlotTable>::value &&
+    !std::is_copy_assignable<DirectSlotTable>::value &&
+    !std::is_move_constructible<DirectSlotTable>::value &&
+    !std::is_move_assignable<DirectSlotTable>::value,
+    "DirectSlotTable must be non-copyable and non-movable"
+);
+
 struct OptimisticBufferPool {
     std::vector<char*> buffers;
     size_t pooled_size = 0;
@@ -115,6 +123,14 @@ struct OptimisticBufferPool {
         }
     }
 };
+
+static_assert(
+    !std::is_copy_constructible<OptimisticBufferPool>::value &&
+    !std::is_copy_assignable<OptimisticBufferPool>::value &&
+    !std::is_move_constructible<OptimisticBufferPool>::value &&
+    !std::is_move_assignable<OptimisticBufferPool>::value,
+    "OptimisticBufferPool must be non-copyable and non-movable"
+);
 
 static struct io_uring ring;
 static bool ring_supported = false;

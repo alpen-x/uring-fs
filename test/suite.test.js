@@ -3341,6 +3341,8 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
       const cfgOff = uringFs.configure({ restrictions: false });
       assert.equal(cfgOff.restrictions, false);
       assert.equal(uringFs.getRingStats().restrictionsSupported, false);
+      assert.equal(uringFs.getRingStatus().restrictionsSupported, false);
+      assert.equal(uringFs.getRingStats().allowedOpcodesCount, 0);
       const probeOff = uringFs.probeRingRestriction();
       assert.equal(probeOff.restricted, false);
       assert.notEqual(probeOff.blockedSocketErrno, -13);
@@ -3348,8 +3350,38 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
       const cfgOn = uringFs.configure({ restrictions: true });
       assert.equal(cfgOn.restrictions, true);
       if (uringFs.isUringSupported()) {
-        assert.equal(uringFs.getRingStats().restrictionsSupported, true);
+        const stOn = uringFs.getRingStats();
+        assert.equal(stOn.restrictionsSupported, true);
+        assert.equal(uringFs.getRingStatus().restrictionsSupported, true);
+        assert.equal(stOn.allowedOpcodesCount, 22);
+        assert.equal(stOn.directFdsSupported, true);
         assert.deepEqual(uringFs.probeRingRestriction(), { restricted: true, blockedSocketErrno: -13 });
+      }
+
+      // Regression guard: configure({ restrictions }) while a direct-slot handle is open must NOT tear down the live ring
+      const guardFile = path.join(tmpDir, 'v134_reinit_guard.txt');
+      await uringFs.writeFile(guardFile, 'active-handle-guard');
+      const openFh = await uringFs.open(guardFile, 'r');
+      try {
+        if (uringFs.isUringSupported()) {
+          assert.equal(uringFs.getRingStats().directFdsInUse, 1);
+          uringFs.configure({ restrictions: false });
+          // Ring remains active and restricted while direct slot is in use
+          assert.equal(uringFs.getRingStats().restrictionsSupported, true);
+        }
+        const buf = Buffer.alloc(19);
+        const { bytesRead } = await openFh.read(buf, 0, 19, 0);
+        assert.equal(bytesRead, 19);
+        assert.equal(buf.toString('utf8'), 'active-handle-guard');
+      } finally {
+        await openFh.close();
+      }
+      // Once the handle is closed and the ring is idle, configure({ restrictions: false }) applies cleanly
+      uringFs.configure({ restrictions: false });
+      assert.equal(uringFs.getRingStats().restrictionsSupported, false);
+      uringFs.configure({ restrictions: true });
+      if (uringFs.isUringSupported()) {
+        assert.equal(uringFs.getRingStats().restrictionsSupported, true);
       }
     } finally {
       uringFs.configure({ restrictions: process.env.URING_FS_RESTRICTIONS !== '0' });
@@ -3410,7 +3442,7 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
     assert.equal(postStats.activeRequests, 0);
     assert.equal(postStats.directFdsInUse, 0);
 
-    // Intrusive live_requests_head CleanupModule teardown with queued requests
+    // Intrusive live_requests_head CleanupModule teardown with queued requests (io_uring_queue_exit before freeing buffers)
     const intrusiveChild = spawnSync(
       process.execPath,
       [
@@ -3427,6 +3459,18 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
         encoding: 'utf8',
       }
     );
+    assert.equal(intrusiveChild.signal, null);
     assert.equal(intrusiveChild.status, 0, `Intrusive CleanupModule subprocess failed: ${intrusiveChild.stderr}`);
+
+    // F. OIDC Trusted Publishing & npm stage publish fallback regression guard in publish.yml
+    const publishYml = await uringFs.readFile(
+      path.join(__dirname, '..', '.github', 'workflows', 'publish.yml'),
+      'utf8'
+    );
+    assert.match(publishYml, /id-token:\s*write/);
+    assert.match(
+      publishYml,
+      /npm publish --provenance --access public \|\| npm stage publish --provenance --access public/
+    );
   });
 });
