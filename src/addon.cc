@@ -224,6 +224,7 @@ static void CleanupModule(void* arg) {
     direct_slots.Reset();
     ring_restrictions_supported = false;
     restricted_opcodes_count = 0;
+    creds_checked_this_tick = false;
 }
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
@@ -236,11 +237,15 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
             restrictions_enabled_config = false;
         }
 
+        const uint32_t depth_attempts[] = { DEFAULT_QUEUE_DEPTH, MID_QUEUE_DEPTH, FALLBACK_QUEUE_DEPTH };
         uint32_t depth = DEFAULT_QUEUE_DEPTH;
-        int ret = InitRingWithRestrictionsAndBestFlags(depth, &ring);
-        if (ret < 0) {
-            depth = FALLBACK_QUEUE_DEPTH;
+        int ret = -EINVAL;
+        for (uint32_t candidate : depth_attempts) {
+            depth = candidate;
             ret = InitRingWithRestrictionsAndBestFlags(depth, &ring);
+            if (ret == 0) {
+                break;
+            }
         }
 
         if (ret < 0) {

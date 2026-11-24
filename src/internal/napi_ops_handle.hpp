@@ -45,6 +45,7 @@ Napi::Value OpenHandleUring(const Napi::CallbackInfo& info) {
     int openFlags = (info.Length() >= 2 && info[1].IsNumber()) ? info[1].As<Napi::Number>().Int32Value() : O_RDONLY;
     mode_t mode = (info.Length() >= 3 && info[2].IsNumber()) ? static_cast<mode_t>(info[2].As<Napi::Number>().Uint32Value()) : 0666;
 
+    creds_checked_this_tick = false;
     if (!EnsureCredentialsSafe()) {
         Napi::Promise::Deferred deferred = Napi::Promise::Deferred::New(env);
         deferred.Reject(CreateErrnoError(env, EPERM, "io_uring", filePath));

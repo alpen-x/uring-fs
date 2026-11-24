@@ -3231,6 +3231,15 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
       }
     );
 
+    await assert.rejects(
+      () => uringFs.writeFile(tmpDir, 'x'),
+      (err) => {
+        assert.equal(err.code, 'EISDIR');
+        assert.match(err.stack, /\n\s+at /);
+        return true;
+      }
+    );
+
     // Also verify UringFileHandle native rejections include caller stack frames
     const roFile = path.join(tmpDir, 'round4_ro_handle.txt');
     await uringFs.writeFile(roFile, 'ro');
@@ -3449,7 +3458,7 @@ describe('uring-fs - Full Test Suite (io_uring + Fallbacks)', () => {
         '-e',
         `const u = require('./index.js');
          const p = ${JSON.stringify(poolFile)};
-         for (let i = 0; i < 800; i++) {
+         for (let i = 0; i < 1200; i++) {
            u.readFile(p).catch(() => {});
          }
          process.exit(0);`,

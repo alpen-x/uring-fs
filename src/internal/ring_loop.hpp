@@ -40,7 +40,8 @@ static inline void ResolveFinishedRequests(std::vector<IORequest*>& finished_req
                         }
                     } else if (req->buffer_capacity > 0 &&
                                req->buffer_capacity == default_optimistic_read_size &&
-                               req->size <= default_optimistic_read_size) {
+                               req->size <= default_optimistic_read_size &&
+                               req->size <= OPTIMISTIC_COPY_THRESHOLD) {
                         Napi::Buffer<char> out = Napi::Buffer<char>::Copy(req->env, req->buffer, req->size);
                         if (req->env.IsExceptionPending()) {
                             RejectWithPendingExceptionOrErrno(req, "read");
@@ -129,6 +130,7 @@ static void ProcessCompletions() {
         return;
     }
     in_poll_callback = true;
+    creds_checked_this_tick = false;
 
     std::vector<IORequest*> finished_requests;
     finished_requests.reserve(128);
@@ -138,7 +140,7 @@ static void ProcessCompletions() {
         stats.cq_overflows++;
         (void)io_uring_get_events(&ring);
     }
-    if (RingNeedsTaskRun(&ring)) {
+    if (io_uring_cq_ready(&ring) == 0 && RingNeedsTaskRun(&ring)) {
         (void)io_uring_get_events(&ring);
     }
 
@@ -241,6 +243,7 @@ static void ProcessCompletions() {
     }
 
     UnrefEventLoopIfIdle();
+    creds_checked_this_tick = false;
     in_poll_callback = false;
 }
 

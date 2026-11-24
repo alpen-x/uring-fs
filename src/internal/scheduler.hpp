@@ -559,6 +559,7 @@ static void DrainPendingQueue() {
 
 static void OnPrepareFlush(uv_prepare_t* handle) {
     (void)handle;
+    creds_checked_this_tick = false;
     DrainPendingQueue();
     FlushSubmissions();
     if (pending_queue.empty() && pending_pair2_queue.empty() && unsubmitted_sqes == 0) {
@@ -568,6 +569,7 @@ static void OnPrepareFlush(uv_prepare_t* handle) {
 
 static void OnCheckFlush(uv_check_t* handle) {
     (void)handle;
+    creds_checked_this_tick = false;
     DrainPendingQueue();
     FlushSubmissions();
     if (pending_queue.empty() && pending_pair2_queue.empty() && unsubmitted_sqes == 0) {

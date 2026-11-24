@@ -116,7 +116,8 @@ struct OptimisticBufferPool {
         if (capacity > 0 &&
             capacity == default_size &&
             pooled_size == default_size &&
-            buffers.size() < MAX_POOLED_BUFFERS) {
+            buffers.size() < MAX_POOLED_BUFFERS &&
+            (buffers.size() + 1) * capacity <= MAX_POOLED_BYTES) {
             buffers.push_back(buf);
         } else {
             std::free(buf);
@@ -158,6 +159,7 @@ static std::string unsupported_reason;
 
 static uid_t ring_euid = 0;
 static gid_t ring_egid = 0;
+static bool creds_checked_this_tick = false;
 
 static uint64_t active_requests = 0;
 static uint32_t in_flight_sqes = 0;
@@ -372,6 +374,7 @@ inline IORequest::~IORequest() {
 }
 
 static void FlushSubmissions() {
+    creds_checked_this_tick = false;
     if (unadvanced_cqes > 0 && ring_supported) {
         io_uring_cq_advance(&ring, unadvanced_cqes);
         unadvanced_cqes = 0;
@@ -500,6 +503,7 @@ static void UnrefEventLoopIfIdle() {
 // handles are active. Used both for credential resets (CVE-2024-22017) and runtime configure({ restrictions }).
 static bool ReinitIdleRing(bool is_credential_reset = false) {
     if (!ring_supported) return false;
+    creds_checked_this_tick = false;
 
     if (unsubmitted_sqes > 0) {
         FlushSubmissions();
@@ -540,13 +544,22 @@ static bool ReinitIdleRing(bool is_credential_reset = false) {
 static bool EnsureCredentialsSafe() {
     if (!ring_supported) return false;
 
-    uid_t cur_uid = geteuid();
-    gid_t cur_gid = getegid();
-    if (cur_uid == ring_euid && cur_gid == ring_egid) {
+    if (__builtin_expect(creds_checked_this_tick, 1)) {
         return true;
     }
 
-    return ReinitIdleRing(true);
+    uid_t cur_uid = geteuid();
+    gid_t cur_gid = getegid();
+    if (cur_uid == ring_euid && cur_gid == ring_egid) {
+        creds_checked_this_tick = true;
+        return true;
+    }
+
+    bool ok = ReinitIdleRing(true);
+    if (ok) {
+        creds_checked_this_tick = true;
+    }
+    return ok;
 }
 
 #endif // URING_FS_INTERNAL_RING_STATE_HPP
