@@ -32,18 +32,20 @@ When a server performs CPU-bound thread-pool work (such as password hashing, TLS
 
 ---
 
-## Benchmarks Across Node.js 20, 22, 24, and 26 (Linux 6.8)
+## Benchmarks Across Node.js 20, 22, 24, and 26 (Linux 6.8, `v1.3.4`)
 
-| Workload / Metric | Node.js `v20` | Node.js `v22` | Node.js `v24` | Node.js `v26` |
+| Workload / Metric | Node.js `v20` (`v20.10.0`) | Node.js `v22` (`v22.17.0`) | Node.js `v24` (`v24.22.1`) | Node.js `v26` (`v26.12.1`) |
 | :--- | :---: | :---: | :---: | :---: |
-| **1,000 Concurrent Reads (4 KB each)**<br>`uring-fs` vs `node:fs/promises` | **`4.12 ms`** vs `16.80 ms`<br>**(4.08x faster)** | **`3.85 ms`** vs `15.90 ms`<br>**(4.13x faster)** | **`3.79 ms`** vs `15.40 ms`<br>**(4.06x faster)** | **`3.62 ms`** vs `14.95 ms`<br>**(4.13x faster)** |
-| **1,000 Concurrent Writes (4 KB each)**<br>`uring-fs` vs `node:fs/promises` | **`7.90 ms`** vs `21.50 ms`<br>**(2.72x faster)** | **`7.51 ms`** vs `20.80 ms`<br>**(2.77x faster)** | **`7.40 ms`** vs `20.10 ms`<br>**(2.72x faster)** | **`7.15 ms`** vs `19.60 ms`<br>**(2.74x faster)** |
-| **100 Concurrent Reads (128 KB each)**<br>`uring-fs` vs `node:fs/promises` | **`1.85 ms`** vs `2.29 ms`<br>*(1.24x faster)* | **`1.73 ms`** vs `2.00 ms`<br>*(1.16x faster)* | **`1.78 ms`** vs `2.15 ms`<br>*(1.21x faster)* | **`1.65 ms`** vs `1.90 ms`<br>*(1.15x faster)* |
+| **1,000 Concurrent Reads (4 KB each)**<br>`uring-fs` vs `node:fs/promises` | **`5.16 ms`** vs `13.59 ms`<br>**(2.64x faster)** | **`4.98 ms`** vs `18.71 ms`<br>**(3.76x faster)** | **`4.60 ms`** vs `17.14 ms`<br>**(3.73x faster)** | `4.46 ms` vs **`2.00 ms`**<br>*(2.23x slower, uncontended cache)* |
+| **1,000 Concurrent Writes (4 KB each)**<br>`uring-fs` vs `node:fs/promises` | **`9.41 ms`** vs `12.85 ms`<br>**(1.37x faster)** | **`9.55 ms`** vs `12.93 ms`<br>**(1.35x faster)** | `8.83 ms` vs **`8.54 ms`**<br>*(1.03x slower, uncontended cache)* | `8.67 ms` vs **`6.30 ms`**<br>*(1.38x slower, uncontended cache)* |
+| **100 Concurrent Reads (128 KB each)**<br>`uring-fs` vs `node:fs/promises` | `4.72 ms` vs **`1.97 ms`**<br>*(2.40x slower, uncontended cache)* | `5.33 ms` vs **`2.82 ms`**<br>*(1.89x slower, uncontended cache)* | `4.50 ms` vs **`3.35 ms`**<br>*(1.34x slower, uncontended cache)* | `4.79 ms` vs **`2.02 ms`**<br>*(2.37x slower, uncontended cache)* |
 | **Auto-Batching Syscall Reduction**<br>*(15,000 SQEs dispatched)* | **99.8% saved**<br>*(35 syscalls)* | **99.8% saved**<br>*(35 syscalls)* | **99.8% saved**<br>*(35 syscalls)* | **99.8% saved**<br>*(35 syscalls)* |
-| **Mixed Server Load (20x 128 KB + `pbkdf2`)**<br>`uring-fs` vs `node:fs/promises` | **`1.05 ms`** vs `1.51 ms`*<br>*(1.4x faster)* | **`0.43 ms`** vs `91.54 ms`<br>**(214.1x faster)** | **`0.43 ms`** vs `77.58 ms`<br>**(179.1x faster)** | **`0.42 ms`** vs `68.49 ms`<br>**(164.5x faster)** |
-| **Thread-Pool Starvation Latency**<br>`uring-fs` vs `node:fs/promises` | **`0.96 ms`** vs `1.93 ms`*<br>*(2.0x faster)* | **`0.34 ms`** vs `227.42 ms`<br>**(675x faster)** | **`0.36 ms`** vs `191.79 ms`<br>**(540x faster)** | **`0.78 ms`** vs `178.71 ms`<br>**(229x faster)** |
+| **Mixed Server Load (20x 128 KB + `pbkdf2`)**<br>`uring-fs` vs `node:fs/promises` | **`0.58 ms`** vs `0.81 ms`*<br>*(1.4x faster)* | **`0.74 ms`** vs `89.96 ms`<br>**(122.2x faster)** | **`0.71 ms`** vs `78.25 ms`<br>**(109.9x faster)** | **`0.72 ms`** vs `72.19 ms`<br>**(100.1x faster)** |
+| **Thread-Pool Starvation Latency**<br>`uring-fs` vs `node:fs/promises` | **`0.52 ms`** vs `1.40 ms`*<br>*(3x faster)* | **`0.38 ms`** vs `229.20 ms`<br>**(608x faster)** | **`0.92 ms`** vs `195.90 ms`<br>**(214x faster)** | **`0.37 ms`** vs `181.56 ms`<br>**(486x faster)** |
 
-*\*Note: Early Node 20.6–20.11 releases had experimental internal `libuv` `io_uring` enabled before it was disabled in Node 20.11.1+ due to `CVE-2024-22017`. Even against `libuv`'s own internal `io_uring`, `uring-fs` is 1.4x–2.0x faster while remaining protected against `CVE-2024-22017`.*
+*\*Note: Early Node 20.6–20.11 releases had experimental internal `libuv` `io_uring` enabled before it was disabled in Node 20.11.1+ due to `CVE-2024-22017`. Even against `libuv`'s own internal `io_uring`, `uring-fs` is ~1.4x–3x faster while remaining protected against `CVE-2024-22017`.*
+
+*\*\*Note on uncontended microbenchmarks: On Linux warm page cache with an idle `libuv` thread pool, Node 26's updated `fs/promises` path can dispatch across 4 idle threads faster in raw wall-clock microbenchmarks, whereas under realistic mixed server or crypto/zlib thread-pool contention `uring-fs` remains **100x–486x faster** across Node.js 22, 24, and 26.*
 
 ---
 

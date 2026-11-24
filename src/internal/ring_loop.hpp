@@ -138,6 +138,9 @@ static void ProcessCompletions() {
         stats.cq_overflows++;
         (void)io_uring_get_events(&ring);
     }
+    if (RingNeedsTaskRun(&ring)) {
+        (void)io_uring_get_events(&ring);
+    }
 
     while (io_uring_cq_ready(&ring) > 0 && passes < 64) {
         passes++;
@@ -221,6 +224,9 @@ static void ProcessCompletions() {
         }
         DrainPendingQueue();
         FlushSubmissions();
+        if (io_uring_cq_ready(&ring) == 0 && RingNeedsTaskRun(&ring)) {
+            (void)io_uring_get_events(&ring);
+        }
     }
 
     ResolveFinishedRequests(finished_requests);

@@ -95,6 +95,9 @@
 #ifndef IORING_SQ_CQ_OVERFLOW
 #define IORING_SQ_CQ_OVERFLOW (1U << 1)
 #endif
+#ifndef IORING_SQ_TASKRUN
+#define IORING_SQ_TASKRUN (1U << 2)
+#endif
 
 #define DEFAULT_QUEUE_DEPTH 512
 #define FALLBACK_QUEUE_DEPTH 128
@@ -217,6 +220,13 @@ inline bool RingHasCqOverflow(const struct io_uring* r) {
         return false;
     }
     return (__atomic_load_n(r->sq.kflags, __ATOMIC_RELAXED) & IORING_SQ_CQ_OVERFLOW) != 0;
+}
+
+inline bool RingNeedsTaskRun(const struct io_uring* r) {
+    if (!r || !r->sq.kflags) {
+        return false;
+    }
+    return (__atomic_load_n(r->sq.kflags, __ATOMIC_RELAXED) & IORING_SQ_TASKRUN) != 0;
 }
 
 inline Napi::Object CreateErrnoError(
