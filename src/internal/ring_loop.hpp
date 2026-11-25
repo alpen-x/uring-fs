@@ -140,7 +140,7 @@ static void ProcessCompletions() {
         stats.cq_overflows++;
         (void)io_uring_get_events(&ring);
     }
-    if (io_uring_cq_ready(&ring) == 0 && RingNeedsTaskRun(&ring)) {
+    if (RingNeedsTaskRun(&ring)) {
         (void)io_uring_get_events(&ring);
     }
 
