@@ -263,6 +263,10 @@ export interface UringFsConfig {
    * Setting to 0 disables optimistic read globally.
    */
   optimisticReadSize?: number;
+  /**
+   * Enables or disables kernel opcode restrictions (`IORING_REGISTER_RESTRICTIONS`, default: true unless `URING_FS_RESTRICTIONS=0`).
+   */
+  restrictions?: boolean;
 }
 
 export interface RingStats {
@@ -283,7 +287,27 @@ export interface RingStats {
   directFdsSupported: boolean;
   directFdTableSize: number;
   directFdsInUse: number;
+  restrictionsSupported: boolean;
+  allowedOpcodesCount: number;
+  cqSize: number;
+  cqOverflows: number;
   syscallsSavedByBatching: number;
+}
+
+export interface RingRestrictionProbe {
+  restricted: boolean;
+  blockedSocketErrno: number;
+}
+
+export interface RingStatus {
+  activeBackend: 'io_uring' | 'worker' | 'custom' | 'fs' | 'none';
+  isUringSupported: boolean;
+  fallbackReason: string | null;
+  restrictionsSupported: boolean;
+  allowedOpcodesCount: number;
+  queueDepth: number;
+  cqSize: number;
+  optimisticReadSize: number;
 }
 
 export class UringStats {
@@ -422,11 +446,14 @@ export function isUringSupported(): boolean;
 export function getActiveBackend(): 'io_uring' | 'worker' | 'custom' | 'fs' | 'none';
 export function getUnsupportedReason(): string | null;
 export function getRingStats(): RingStats;
+export function probeRingRestriction(): RingRestrictionProbe;
+export function getRingStatus(): RingStatus;
 export function configure(options?: UringFsConfig): {
   fallback: 'fs' | 'worker' | 'custom' | false;
   forceFallback: boolean;
   workerPoolSize: number;
   optimisticReadSize: number;
+  restrictions: boolean;
 };
 export function setOptimisticReadSize(bytes: number): number;
 export function closeFallbackWorkers(): Promise<void>;
@@ -559,6 +586,8 @@ declare const _default: {
   getActiveBackend: typeof getActiveBackend;
   getUnsupportedReason: typeof getUnsupportedReason;
   getRingStats: typeof getRingStats;
+  probeRingRestriction: typeof probeRingRestriction;
+  getRingStatus: typeof getRingStatus;
   configure: typeof configure;
   setOptimisticReadSize: typeof setOptimisticReadSize;
   closeFallbackWorkers: typeof closeFallbackWorkers;

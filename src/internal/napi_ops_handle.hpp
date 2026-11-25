@@ -45,6 +45,7 @@ Napi::Value OpenHandleUring(const Napi::CallbackInfo& info) {
     int openFlags = (info.Length() >= 2 && info[1].IsNumber()) ? info[1].As<Napi::Number>().Int32Value() : O_RDONLY;
     mode_t mode = (info.Length() >= 3 && info[2].IsNumber()) ? static_cast<mode_t>(info[2].As<Napi::Number>().Uint32Value()) : 0666;
 
+    creds_checked_this_tick = false;
     if (!EnsureCredentialsSafe()) {
         Napi::Promise::Deferred deferred = Napi::Promise::Deferred::New(env);
         deferred.Reject(CreateErrnoError(env, EPERM, "io_uring", filePath));
@@ -55,7 +56,7 @@ Napi::Value OpenHandleUring(const Napi::CallbackInfo& info) {
     req->open_flags = openFlags;
     req->mode = mode;
 
-    if (direct_fds_supported && direct_fd_free_list.size() > MAX_HANDLE_DIRECT_SLOTS) {
+    if (direct_slots.supported && direct_slots.FreeCount() > MAX_HANDLE_DIRECT_SLOTS) {
         int slot = AllocateDirectSlot();
         if (slot >= 0) {
             req->direct_slot = slot;

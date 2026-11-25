@@ -125,7 +125,15 @@ struct IORequest {
     const char* failed_syscall;
     struct statx stx;
 
+    IORequest* prev_live = nullptr;
+    IORequest* next_live = nullptr;
+
     inline IORequest(Napi::Env e, OperationType o, RequestStage initial_stage, std::string p);
+
+    IORequest(const IORequest&) = delete;
+    IORequest& operator=(const IORequest&) = delete;
+    IORequest(IORequest&&) = delete;
+    IORequest& operator=(IORequest&&) = delete;
 
     ~IORequest();
 };
@@ -138,6 +146,7 @@ struct RingStats {
     uint64_t peak_in_flight = 0;
     uint64_t overflow_queued = 0;
     uint64_t credential_resets = 0;
+    uint64_t cq_overflows = 0;
     uint32_t queue_depth = 0;
 };
 

@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <sys/sysmacros.h>
 #include <sys/uio.h>
 #include <linux/falloc.h>
@@ -28,7 +29,7 @@
 #include <cstdlib>
 #include <cerrno>
 #include <deque>
-#include <unordered_set>
+#include <type_traits>
 #include <vector>
 #ifdef __GLIBC__
 #include <malloc.h>
@@ -76,32 +77,159 @@
 #define SPLICE_F_MOVE 1
 #endif
 
-#define DEFAULT_QUEUE_DEPTH 512
+#ifndef IORING_SETUP_CQSIZE
+#define IORING_SETUP_CQSIZE (1U << 3)
+#endif
+#ifndef IORING_SETUP_R_DISABLED
+#define IORING_SETUP_R_DISABLED (1U << 6)
+#endif
+#ifndef IORING_SETUP_COOP_TASKRUN
+#define IORING_SETUP_COOP_TASKRUN (1U << 8)
+#endif
+#ifndef IORING_SETUP_TASKRUN_FLAG
+#define IORING_SETUP_TASKRUN_FLAG (1U << 9)
+#endif
+#ifndef IORING_SETUP_SINGLE_ISSUER
+#define IORING_SETUP_SINGLE_ISSUER (1U << 12)
+#endif
+#ifndef IORING_SQ_CQ_OVERFLOW
+#define IORING_SQ_CQ_OVERFLOW (1U << 1)
+#endif
+#ifndef IORING_SQ_TASKRUN
+#define IORING_SQ_TASKRUN (1U << 2)
+#endif
+
+#define DEFAULT_QUEUE_DEPTH 1024
+#define MID_QUEUE_DEPTH 512
 #define FALLBACK_QUEUE_DEPTH 128
 #define MAX_SPLICE_CHUNK (1024 * 1024)
 #define MAX_IO_CHUNK 0x7ffff000ULL
 #define DEFAULT_OPTIMISTIC_READ_SIZE (64 * 1024)
 #define DIRECT_FD_TABLE_SIZE 1024
 static constexpr size_t MAX_HANDLE_DIRECT_SLOTS = 512;
-#define MAX_POOLED_BUFFERS 256
+#define MAX_POOLED_BUFFERS 512
+#define MAX_POOLED_BYTES (32 * 1024 * 1024)
+#define OPTIMISTIC_COPY_THRESHOLD (64 * 1024)
 
-// Initializes io_uring using modern kernel flags (COOP_TASKRUN + SINGLE_ISSUER) when supported,
-// gracefully falling back to baseline flags (0) on older Linux kernels.
-inline int InitRingWithBestFlags(uint32_t depth, struct io_uring* r) {
-    unsigned int flags = 0;
-#ifdef IORING_SETUP_COOP_TASKRUN
-    flags |= IORING_SETUP_COOP_TASKRUN;
-#endif
-#ifdef IORING_SETUP_SINGLE_ISSUER
-    flags |= IORING_SETUP_SINGLE_ISSUER;
-#endif
-    if (flags != 0) {
-        int ret = io_uring_queue_init(depth, r, flags);
+static constexpr uint8_t ALLOWED_URING_FS_OPCODES[] = {
+    IORING_OP_NOP,
+    IORING_OP_READV,
+    IORING_OP_WRITEV,
+    IORING_OP_FSYNC,
+    IORING_OP_READ_FIXED,
+    IORING_OP_WRITE_FIXED,
+    IORING_OP_ASYNC_CANCEL,
+    IORING_OP_FALLOCATE,
+    IORING_OP_OPENAT,
+    IORING_OP_CLOSE,
+    IORING_OP_FILES_UPDATE,
+    IORING_OP_STATX,
+    IORING_OP_READ,
+    IORING_OP_WRITE,
+    IORING_OP_FADVISE,
+    IORING_OP_OPENAT2,
+    IORING_OP_SPLICE,
+    IORING_OP_RENAMEAT,
+    IORING_OP_UNLINKAT,
+    IORING_OP_MKDIRAT,
+    IORING_OP_SYMLINKAT,
+    IORING_OP_LINKAT,
+};
+
+static constexpr uint32_t ALLOWED_URING_FS_OPCODES_COUNT =
+    static_cast<uint32_t>(sizeof(ALLOWED_URING_FS_OPCODES) / sizeof(ALLOWED_URING_FS_OPCODES[0]));
+
+// Initializes io_uring using progressive modern kernel flags (CQSIZE 4x + SINGLE_ISSUER +
+// COOP_TASKRUN + TASKRUN_FLAG) when supported, gracefully falling back on older kernels.
+inline int InitRingWithBestFlags(unsigned depth, struct io_uring* r, unsigned extra_flags = 0) {
+    const unsigned flag_attempts[] = {
+        extra_flags | IORING_SETUP_CQSIZE | IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG,
+        extra_flags | IORING_SETUP_CQSIZE | IORING_SETUP_COOP_TASKRUN,
+        extra_flags | IORING_SETUP_CQSIZE,
+    };
+    for (unsigned flags : flag_attempts) {
+        struct io_uring_params params = {};
+        params.flags = flags;
+        params.cq_entries = depth * 4U;
+        int ret = io_uring_queue_init_params(depth, r, &params);
         if (ret == 0) {
             return 0;
         }
     }
-    return io_uring_queue_init(depth, r, 0);
+    struct io_uring_params params = {};
+    params.flags = extra_flags;
+    return io_uring_queue_init_params(depth, r, &params);
+}
+
+// Registers an explicit SQE and register-op whitelist on a ring initialized with IORING_SETUP_R_DISABLED,
+// then activates the ring via io_uring_enable_rings().
+inline int ApplyRingRestrictions(struct io_uring* r) {
+    static constexpr uint8_t MODERN_REGISTER_OPS[] = {
+        IORING_REGISTER_ENABLE_RINGS,
+        IORING_REGISTER_FILES,
+        IORING_REGISTER_FILES_UPDATE,
+        IORING_REGISTER_FILES2,
+        IORING_REGISTER_FILES_UPDATE2,
+        IORING_REGISTER_BUFFERS,
+        IORING_REGISTER_BUFFERS2,
+        IORING_REGISTER_BUFFERS_UPDATE,
+        IORING_UNREGISTER_BUFFERS,
+        IORING_REGISTER_PROBE,
+        IORING_REGISTER_SYNC_CANCEL,
+    };
+    static constexpr uint8_t CORE_REGISTER_OPS[] = {
+        IORING_REGISTER_ENABLE_RINGS,
+        IORING_REGISTER_FILES,
+        IORING_REGISTER_FILES_UPDATE,
+        IORING_REGISTER_BUFFERS,
+        IORING_UNREGISTER_BUFFERS,
+        IORING_REGISTER_PROBE,
+    };
+
+    auto try_register = [r](const uint8_t* reg_ops, size_t reg_count) -> int {
+        std::vector<struct io_uring_restriction> res(ALLOWED_URING_FS_OPCODES_COUNT + reg_count + 1);
+        std::memset(res.data(), 0, res.size() * sizeof(struct io_uring_restriction));
+        size_t idx = 0;
+        for (uint32_t i = 0; i < ALLOWED_URING_FS_OPCODES_COUNT; ++i) {
+            res[idx].opcode = IORING_RESTRICTION_SQE_OP;
+            res[idx].sqe_op = ALLOWED_URING_FS_OPCODES[i];
+            idx++;
+        }
+        for (size_t i = 0; i < reg_count; ++i) {
+            res[idx].opcode = IORING_RESTRICTION_REGISTER_OP;
+            res[idx].register_op = reg_ops[i];
+            idx++;
+        }
+        res[idx].opcode = IORING_RESTRICTION_SQE_FLAGS_ALLOWED;
+        res[idx].sqe_flags = static_cast<__u8>(
+            IOSQE_FIXED_FILE | IOSQE_IO_LINK | IOSQE_IO_HARDLINK | IOSQE_IO_DRAIN | IOSQE_ASYNC
+        );
+        idx++;
+        return io_uring_register_restrictions(r, res.data(), static_cast<unsigned int>(res.size()));
+    };
+
+    int ret = try_register(MODERN_REGISTER_OPS, sizeof(MODERN_REGISTER_OPS) / sizeof(MODERN_REGISTER_OPS[0]));
+    if (ret == -EINVAL) {
+        ret = try_register(CORE_REGISTER_OPS, sizeof(CORE_REGISTER_OPS) / sizeof(CORE_REGISTER_OPS[0]));
+    }
+    if (ret < 0) {
+        return ret;
+    }
+    return io_uring_enable_rings(r);
+}
+
+inline bool RingHasCqOverflow(const struct io_uring* r) {
+    if (!r || !r->sq.kflags) {
+        return false;
+    }
+    return (__atomic_load_n(r->sq.kflags, __ATOMIC_RELAXED) & IORING_SQ_CQ_OVERFLOW) != 0;
+}
+
+inline bool RingNeedsTaskRun(const struct io_uring* r) {
+    if (!r || !r->sq.kflags) {
+        return false;
+    }
+    return (__atomic_load_n(r->sq.kflags, __ATOMIC_RELAXED) & IORING_SQ_TASKRUN) != 0;
 }
 
 inline Napi::Object CreateErrnoError(

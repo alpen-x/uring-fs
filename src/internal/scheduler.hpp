@@ -213,7 +213,7 @@ static bool ReserveLinkedChain(
     mode_t open_mode,
     struct io_uring_sqe** out_sqes
 ) {
-    if (!direct_fds_supported || !HasSqSpaceForChain(num_sqes)) {
+    if (!direct_slots.supported || !HasSqSpaceForChain(num_sqes)) {
         return false;
     }
     int slot = AllocateDirectSlot();
@@ -275,7 +275,7 @@ static bool TryScheduleLinked3Sqe(
 // - When optimistic_read_size > 0: links OPENAT_DIRECT(slot) -> READ(slot, optimistic_read_size) in a single submission.
 // - When optimistic_read_size == 0: links OPENAT_DIRECT(slot) -> STATX(path) in Pair 1, then READ(slot) -> CLOSE_DIRECT(slot) in Pair 2.
 static bool TryScheduleLinkedReadPair1(IORequest* req) {
-    if (!direct_fds_supported || !HasSqSpaceForChain(2)) {
+    if (!direct_slots.supported || !HasSqSpaceForChain(2)) {
         return false;
     }
     int slot = AllocateDirectSlot();
@@ -322,7 +322,7 @@ static bool TryScheduleLinkedReadPair1(IORequest* req) {
 }
 
 static bool TryScheduleLinkedReadAt(IORequest* req) {
-    if (!direct_fds_supported || req->size > MAX_IO_CHUNK || !HasSqSpaceForChain(3)) {
+    if (!direct_slots.supported || req->size > MAX_IO_CHUNK || !HasSqSpaceForChain(3)) {
         return false;
     }
     int slot = AllocateDirectSlot();
@@ -370,7 +370,7 @@ static bool TryScheduleLinkedReadPair2(IORequest* req) {
 }
 
 static bool TryScheduleLinkedReadBatchAt(IORequest* req) {
-    if (!direct_fds_supported || req->batch_slices.empty() || req->batch_slices.size() > 30) {
+    if (!direct_slots.supported || req->batch_slices.empty() || req->batch_slices.size() > 30) {
         return false;
     }
     for (const auto& s : req->batch_slices) {
@@ -435,31 +435,31 @@ static bool TryScheduleLinkedForOpen(IORequest* req, bool* should_wait_for_direc
     }
     switch (req->op) {
         case OP_WRITE_FILE:
-            *should_wait_for_direct = direct_fds_supported;
+            *should_wait_for_direct = direct_slots.supported;
             return TryScheduleLinkedWrite(req);
         case OP_FSYNC:
-            *should_wait_for_direct = direct_fds_supported;
+            *should_wait_for_direct = direct_slots.supported;
             return TryScheduleLinked3Sqe(req, STAGE_FSYNC, req->open_flags, req->mode);
         case OP_READ_FILE:
-            *should_wait_for_direct = direct_fds_supported;
+            *should_wait_for_direct = direct_slots.supported;
             return TryScheduleLinkedReadPair1(req);
         case OP_READ_AT:
-            *should_wait_for_direct = direct_fds_supported && req->size <= MAX_IO_CHUNK;
+            *should_wait_for_direct = direct_slots.supported && req->size <= MAX_IO_CHUNK;
             return TryScheduleLinkedReadAt(req);
         case OP_READ_BATCH_AT:
-            *should_wait_for_direct = direct_fds_supported && req->batch_slices.size() <= 30;
+            *should_wait_for_direct = direct_slots.supported && req->batch_slices.size() <= 30;
             return TryScheduleLinkedReadBatchAt(req);
         case OP_READV:
-            *should_wait_for_direct = direct_fds_supported;
+            *should_wait_for_direct = direct_slots.supported;
             return TryScheduleLinked3Sqe(req, STAGE_READV, req->open_flags, req->mode);
         case OP_WRITEV:
-            *should_wait_for_direct = direct_fds_supported;
+            *should_wait_for_direct = direct_slots.supported;
             return TryScheduleLinkedWritev(req);
         case OP_FALLOCATE:
-            *should_wait_for_direct = direct_fds_supported;
+            *should_wait_for_direct = direct_slots.supported;
             return TryScheduleLinked3Sqe(req, STAGE_FALLOCATE, req->open_flags, req->mode);
         case OP_FADVISE:
-            *should_wait_for_direct = direct_fds_supported;
+            *should_wait_for_direct = direct_slots.supported;
             return TryScheduleLinked3Sqe(req, STAGE_FADVISE, req->open_flags, req->mode);
         default:
             return false;
@@ -559,6 +559,7 @@ static void DrainPendingQueue() {
 
 static void OnPrepareFlush(uv_prepare_t* handle) {
     (void)handle;
+    creds_checked_this_tick = false;
     DrainPendingQueue();
     FlushSubmissions();
     if (pending_queue.empty() && pending_pair2_queue.empty() && unsubmitted_sqes == 0) {
@@ -568,6 +569,7 @@ static void OnPrepareFlush(uv_prepare_t* handle) {
 
 static void OnCheckFlush(uv_check_t* handle) {
     (void)handle;
+    creds_checked_this_tick = false;
     DrainPendingQueue();
     FlushSubmissions();
     if (pending_queue.empty() && pending_pair2_queue.empty() && unsubmitted_sqes == 0) {

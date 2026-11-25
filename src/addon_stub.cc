@@ -45,11 +45,30 @@ Napi::Value SetFaultInjection(const Napi::CallbackInfo& info) {
     return info.Env().Undefined();
 }
 
+Napi::Value ProbeDisallowedOpcode(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    Napi::Object out = Napi::Object::New(env);
+    out.Set("restricted", Napi::Boolean::New(env, false));
+    out.Set("blockedSocketErrno", Napi::Number::New(env, -38));
+    return out;
+}
+
+Napi::Value SetRestrictionsConfig(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsBoolean()) {
+        Napi::TypeError::New(env, "Expected a boolean for setRestrictionsConfig").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    return Napi::Boolean::New(env, info[0].As<Napi::Boolean>().Value());
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("isSupported", Napi::Function::New(env, IsSupported));
     exports.Set("getUnsupportedReason", Napi::Function::New(env, GetUnsupportedReason));
     exports.Set("setOptimisticReadSize", Napi::Function::New(env, SetOptimisticReadSize));
     exports.Set("setFaultInjection", Napi::Function::New(env, SetFaultInjection));
+    exports.Set("probeDisallowedOpcode", Napi::Function::New(env, ProbeDisallowedOpcode));
+    exports.Set("setRestrictionsConfig", Napi::Function::New(env, SetRestrictionsConfig));
     return exports;
 }
 

@@ -5,6 +5,26 @@ All notable changes to `uring-fs` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.4] - 2026-11-23
+
+### Added
+- **Kernel Opcode Restrictions (`IORING_REGISTER_RESTRICTIONS`):**
+  - Initializes `io_uring` with `IORING_SETUP_R_DISABLED`, registers an explicit allowlist of 22 filesystem SQE opcodes (`ALLOWED_URING_FS_OPCODES`) and safe register opcodes (with automatic `-EINVAL` fallback to Linux 5.10 core register ops), and activates the ring via `io_uring_enable_rings()`.
+  - Added `URING_FS_RESTRICTIONS=0` environment override and `configure({ restrictions?: boolean })`.
+  - Added `probeRingRestriction()` (`native.probeDisallowedOpcode()`), submitting a disallowed `IORING_OP_SOCKET` (45) SQE and verifying `{ restricted: true, blockedSocketErrno: -13 }` (`-EACCES`).
+- **Progressive Ring Setup & CQ Overflow Telemetry:**
+  - Updated `InitRingWithBestFlags()` to request `IORING_SETUP_CQSIZE` with `4 * depth` CQ entries alongside `IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG` with progressive fallbacks.
+  - Added `RingHasCqOverflow(&ring)` detection and `io_uring_get_events(&ring)` flushing in `ProcessCompletions()`, tracking `stats.cq_overflows`.
+  - Added `getRingStatus()` export and `restrictionsSupported`, `allowedOpcodesCount`, `cqSize`, and `cqOverflows` fields to `getRingStats()`.
+
+### Changed & Optimized
+- **O(1) Zero-Allocation Intrusive `live_requests_head` List:**
+  - Replaced `std::unordered_set<IORequest*> live_requests` with an intrusive doubly-linked list (`prev_live` / `next_live` on non-copyable/non-movable `IORequest`), eliminating per-request heap allocations and simplifying `CleanupModule` teardown.
+- **RAII `DirectSlotTable` & `OptimisticBufferPool` (`src/internal/ring_state.hpp`):**
+  - Encapsulated direct descriptor slot management and optimistic read buffer pooling into RAII structs, removing duplicated reset blocks and preventing fallback initialization poisoning.
+- **Hot-Path Promise Optimization (`lib/validators.js`, `lib/file_handle.js`):**
+  - Removed redundant `async`/`await` state machines from `wrapWithAbortSignal`, `#execHandleBackend`, and `#dispatchHandleOp` to eliminate extra microtask hops on the hot path.
+
 ## [1.3.3] - 2026-11-20
 
 ### Changed & Refactored

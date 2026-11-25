@@ -95,10 +95,11 @@ async function main() {
   const smallSubmitsDelta =
     smallStatsAfter.totalSubmitSyscalls - smallStatsBefore.totalSubmitSyscalls;
 
+  const ratio1A = avgSmallFs >= avgSmallUring
+    ? `${(avgSmallFs / avgSmallUring).toFixed(2)}x faster!`
+    : `${(avgSmallUring / avgSmallFs).toFixed(2)}x slower`;
   console.log(
-    `\nScenario 1A Average: node:fs = ${avgSmallFs.toFixed(2)}ms | uring-fs (io_uring) = ${avgSmallUring.toFixed(2)}ms (${(
-      avgSmallFs / avgSmallUring
-    ).toFixed(2)}x faster!)`
+    `\nScenario 1A Average: node:fs = ${avgSmallFs.toFixed(2)}ms | uring-fs (io_uring) = ${avgSmallUring.toFixed(2)}ms (${ratio1A})`
   );
   console.log(
     `Optimistic Read + Direct FD Batching: ${smallSqesDelta} kernel ops in ${smallSubmitsDelta} io_uring_enter syscalls (${(
@@ -127,10 +128,11 @@ async function main() {
   const avgFs = fsTimes.reduce((a, b) => a + b, 0) / fsTimes.length;
   const avgUring = uringTimes.reduce((a, b) => a + b, 0) / uringTimes.length;
 
+  const ratio1B = avgFs >= avgUring
+    ? `${(avgFs / avgUring).toFixed(2)}x faster!`
+    : `${(avgUring / avgFs).toFixed(2)}x slower`;
   console.log(
-    `\nScenario 1B Average: node:fs = ${avgFs.toFixed(2)}ms | uring-fs (io_uring) = ${avgUring.toFixed(2)}ms (${(
-      avgFs / avgUring
-    ).toFixed(2)}x faster!)`
+    `\nScenario 1B Average: node:fs = ${avgFs.toFixed(2)}ms | uring-fs (io_uring) = ${avgUring.toFixed(2)}ms (${ratio1B})`
   );
 
   const sqesDelta = statsAfter.totalSqesPrepared - statsBefore.totalSqesPrepared;

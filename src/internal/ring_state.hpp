@@ -3,15 +3,148 @@
 
 #include "ring_types.hpp"
 
+struct DirectSlotTable {
+    bool supported = false;
+    std::vector<int> free_list;
+    bool allocated[DIRECT_FD_TABLE_SIZE] = { false };
+
+    DirectSlotTable() = default;
+    ~DirectSlotTable() = default;
+    DirectSlotTable(const DirectSlotTable&) = delete;
+    DirectSlotTable& operator=(const DirectSlotTable&) = delete;
+    DirectSlotTable(DirectSlotTable&&) = delete;
+    DirectSlotTable& operator=(DirectSlotTable&&) = delete;
+
+    inline void Reset() {
+        supported = false;
+        free_list.clear();
+        for (int i = 0; i < DIRECT_FD_TABLE_SIZE; ++i) {
+            allocated[i] = false;
+        }
+    }
+
+    inline void Init(struct io_uring* r) {
+        Reset();
+        if (r == nullptr) {
+            return;
+        }
+        int ret = io_uring_register_files_sparse(r, DIRECT_FD_TABLE_SIZE);
+        if (ret == 0) {
+            supported = true;
+            free_list.reserve(DIRECT_FD_TABLE_SIZE);
+            for (int i = DIRECT_FD_TABLE_SIZE - 1; i >= 0; --i) {
+                free_list.push_back(i);
+            }
+        }
+    }
+
+    inline int Allocate() {
+        if (!supported || free_list.empty()) {
+            return -1;
+        }
+        int slot = free_list.back();
+        free_list.pop_back();
+        allocated[slot] = true;
+        return slot;
+    }
+
+    inline void Free(int slot) {
+        if (slot >= 0 && slot < DIRECT_FD_TABLE_SIZE && allocated[slot]) {
+            allocated[slot] = false;
+            free_list.push_back(slot);
+        }
+    }
+
+    inline size_t InUse() const {
+        return supported ? (static_cast<size_t>(DIRECT_FD_TABLE_SIZE) - free_list.size()) : 0;
+    }
+
+    inline size_t FreeCount() const {
+        return supported ? free_list.size() : 0;
+    }
+
+    inline bool AnyInUse() const {
+        return supported && free_list.size() < static_cast<size_t>(DIRECT_FD_TABLE_SIZE);
+    }
+};
+
+static_assert(
+    !std::is_copy_constructible<DirectSlotTable>::value &&
+    !std::is_copy_assignable<DirectSlotTable>::value &&
+    !std::is_move_constructible<DirectSlotTable>::value &&
+    !std::is_move_assignable<DirectSlotTable>::value,
+    "DirectSlotTable must be non-copyable and non-movable"
+);
+
+struct OptimisticBufferPool {
+    std::vector<char*> buffers;
+    size_t pooled_size = 0;
+
+    OptimisticBufferPool() = default;
+    ~OptimisticBufferPool() {
+        Clear();
+    }
+    OptimisticBufferPool(const OptimisticBufferPool&) = delete;
+    OptimisticBufferPool& operator=(const OptimisticBufferPool&) = delete;
+    OptimisticBufferPool(OptimisticBufferPool&&) = delete;
+    OptimisticBufferPool& operator=(OptimisticBufferPool&&) = delete;
+
+    inline void Clear() {
+        for (char* buf : buffers) {
+            std::free(buf);
+        }
+        buffers.clear();
+    }
+
+    inline char* Acquire(size_t size, size_t default_size) {
+        if (size > 0 && size == default_size) {
+            if (pooled_size != default_size) {
+                Clear();
+                pooled_size = default_size;
+            }
+            if (!buffers.empty()) {
+                char* buf = buffers.back();
+                buffers.pop_back();
+                return buf;
+            }
+        }
+        return static_cast<char*>(std::malloc(size));
+    }
+
+    inline void Release(char* buf, size_t capacity, size_t default_size) {
+        if (!buf) return;
+        if (capacity > 0 &&
+            capacity == default_size &&
+            pooled_size == default_size &&
+            buffers.size() < MAX_POOLED_BUFFERS &&
+            (buffers.size() + 1) * capacity <= MAX_POOLED_BYTES) {
+            buffers.push_back(buf);
+        } else {
+            std::free(buf);
+        }
+    }
+};
+
+static_assert(
+    !std::is_copy_constructible<OptimisticBufferPool>::value &&
+    !std::is_copy_assignable<OptimisticBufferPool>::value &&
+    !std::is_move_constructible<OptimisticBufferPool>::value &&
+    !std::is_move_assignable<OptimisticBufferPool>::value,
+    "OptimisticBufferPool must be non-copyable and non-movable"
+);
+
 static struct io_uring ring;
 static bool ring_supported = false;
-static bool direct_fds_supported = false;
-static std::vector<int> direct_fd_free_list;
-static bool direct_slot_allocated[DIRECT_FD_TABLE_SIZE] = { false };
+static bool restrictions_enabled_config = true;
+static bool ring_restrictions_supported = false;
+static uint32_t restricted_opcodes_count = 0;
+static DirectSlotTable direct_slots;
 static size_t default_optimistic_read_size = DEFAULT_OPTIMISTIC_READ_SIZE;
+static OptimisticBufferPool optimistic_pool;
 
-static std::vector<char*> optimistic_buffer_pool;
-static size_t pooled_buffer_size = 0;
+static constexpr uint64_t PROBE_SENTINEL_DATA = 0xFFFFFFFFFFFFFFFEULL;
+static bool probe_pending = false;
+static int probe_last_res = 0;
 
 static uv_poll_t* poll_handle = nullptr;
 static uv_prepare_t prepare_handle;
@@ -26,6 +159,7 @@ static std::string unsupported_reason;
 
 static uid_t ring_euid = 0;
 static gid_t ring_egid = 0;
+static bool creds_checked_this_tick = false;
 
 static uint64_t active_requests = 0;
 static uint32_t in_flight_sqes = 0;
@@ -34,7 +168,7 @@ static unsigned unadvanced_cqes = 0;
 
 static std::deque<IORequest*> pending_queue;
 static std::deque<IORequest*> pending_pair2_queue;
-static std::unordered_set<IORequest*> live_requests;
+static IORequest* live_requests_head = nullptr;
 static RingStats stats;
 
 struct FaultInjectionConfig {
@@ -62,78 +196,59 @@ static void OnCheckFlush(uv_check_t* handle);
 static void ScheduleStage(IORequest* req);
 static void DrainPendingQueue();
 
-static void InitDirectFdTable() {
-    direct_fd_free_list.clear();
-    for (int i = 0; i < DIRECT_FD_TABLE_SIZE; ++i) {
-        direct_slot_allocated[i] = false;
-    }
+static inline void InitDirectFdTable() {
     if (!ring_supported) {
-        direct_fds_supported = false;
+        direct_slots.Reset();
         return;
     }
-    int ret = io_uring_register_files_sparse(&ring, DIRECT_FD_TABLE_SIZE);
+    direct_slots.Init(&ring);
+}
+
+static inline int AllocateDirectSlot() {
+    return direct_slots.Allocate();
+}
+
+static inline void FreeDirectSlot(int slot) {
+    direct_slots.Free(slot);
+}
+
+static inline void ClearOptimisticBufferPool() {
+    optimistic_pool.Clear();
+}
+
+static inline char* AcquireOptimisticBuffer(size_t size) {
+    return optimistic_pool.Acquire(size, default_optimistic_read_size);
+}
+
+static inline void ReleaseOptimisticBuffer(char* buf, size_t capacity) {
+    optimistic_pool.Release(buf, capacity, default_optimistic_read_size);
+}
+
+static inline int InitRingWithRestrictionsAndBestFlags(unsigned depth, struct io_uring* r) {
+    ring_restrictions_supported = false;
+    restricted_opcodes_count = 0;
+    direct_slots.Reset();
+
+    if (restrictions_enabled_config) {
+        int ret = InitRingWithBestFlags(depth, r, IORING_SETUP_R_DISABLED);
+        if (ret == 0) {
+            int rret = ApplyRingRestrictions(r);
+            if (rret == 0) {
+                ring_restrictions_supported = true;
+                restricted_opcodes_count = ALLOWED_URING_FS_OPCODES_COUNT;
+                direct_slots.Init(r);
+                return 0;
+            }
+            io_uring_queue_exit(r);
+            direct_slots.Reset();
+        }
+    }
+
+    int ret = InitRingWithBestFlags(depth, r, 0);
     if (ret == 0) {
-        direct_fds_supported = true;
-        direct_fd_free_list.reserve(DIRECT_FD_TABLE_SIZE);
-        for (int i = DIRECT_FD_TABLE_SIZE - 1; i >= 0; --i) {
-            direct_fd_free_list.push_back(i);
-        }
-    } else {
-        direct_fds_supported = false;
+        direct_slots.Init(r);
     }
-}
-
-static int AllocateDirectSlot() {
-    if (!direct_fds_supported || direct_fd_free_list.empty()) {
-        return -1;
-    }
-    int slot = direct_fd_free_list.back();
-    direct_fd_free_list.pop_back();
-    direct_slot_allocated[slot] = true;
-    return slot;
-}
-
-static void FreeDirectSlot(int slot) {
-    if (slot >= 0 && slot < DIRECT_FD_TABLE_SIZE) {
-        if (direct_slot_allocated[slot]) {
-            direct_slot_allocated[slot] = false;
-            direct_fd_free_list.push_back(slot);
-        }
-    }
-}
-
-static void ClearOptimisticBufferPool() {
-    for (char* buf : optimistic_buffer_pool) {
-        std::free(buf);
-    }
-    optimistic_buffer_pool.clear();
-}
-
-static char* AcquireOptimisticBuffer(size_t size) {
-    if (size > 0 && size == default_optimistic_read_size) {
-        if (pooled_buffer_size != default_optimistic_read_size) {
-            ClearOptimisticBufferPool();
-            pooled_buffer_size = default_optimistic_read_size;
-        }
-        if (!optimistic_buffer_pool.empty()) {
-            char* buf = optimistic_buffer_pool.back();
-            optimistic_buffer_pool.pop_back();
-            return buf;
-        }
-    }
-    return static_cast<char*>(std::malloc(size));
-}
-
-static void ReleaseOptimisticBuffer(char* buf, size_t capacity) {
-    if (!buf) return;
-    if (capacity > 0 &&
-        capacity == default_optimistic_read_size &&
-        pooled_buffer_size == default_optimistic_read_size &&
-        optimistic_buffer_pool.size() < MAX_POOLED_BUFFERS) {
-        optimistic_buffer_pool.push_back(buf);
-    } else {
-        std::free(buf);
-    }
+    return ret;
 }
 
 static inline bool AllocateReadBuffer(IORequest* req) {
@@ -194,11 +309,25 @@ inline IORequest::IORequest(Napi::Env e, OperationType o, RequestStage initial_s
     stx.stx_mask = 0;
     stx.stx_mode = 0;
     stx.stx_size = 0;
-    live_requests.insert(this);
+    prev_live = nullptr;
+    next_live = live_requests_head;
+    if (live_requests_head != nullptr) {
+        live_requests_head->prev_live = this;
+    }
+    live_requests_head = this;
 }
 
 inline IORequest::~IORequest() {
-    live_requests.erase(this);
+    if (prev_live != nullptr) {
+        prev_live->next_live = next_live;
+    } else if (live_requests_head == this) {
+        live_requests_head = next_live;
+    }
+    if (next_live != nullptr) {
+        next_live->prev_live = prev_live;
+    }
+    prev_live = nullptr;
+    next_live = nullptr;
     if (owns_descriptor) {
         if (direct_slot >= 0) {
             FreeDirectSlot(direct_slot);
@@ -245,6 +374,7 @@ inline IORequest::~IORequest() {
 }
 
 static void FlushSubmissions() {
+    creds_checked_this_tick = false;
     if (unadvanced_cqes > 0 && ring_supported) {
         io_uring_cq_advance(&ring, unadvanced_cqes);
         unadvanced_cqes = 0;
@@ -369,23 +499,17 @@ static void UnrefEventLoopIfIdle() {
     }
 }
 
-// Mitigates CVE-2024-22017: If the process changed UID/GID (e.g. via setuid/setgid) and no operations
-// or live direct-FD handles are active, tears down and re-initializes the io_uring instance.
-static bool EnsureCredentialsSafe() {
+// Safely tears down and re-initializes the io_uring instance if no operations or live direct-FD
+// handles are active. Used both for credential resets (CVE-2024-22017) and runtime configure({ restrictions }).
+static bool ReinitIdleRing(bool is_credential_reset = false) {
     if (!ring_supported) return false;
-
-    uid_t cur_uid = geteuid();
-    gid_t cur_gid = getegid();
-    if (cur_uid == ring_euid && cur_gid == ring_egid) {
-        return true;
-    }
+    creds_checked_this_tick = false;
 
     if (unsubmitted_sqes > 0) {
         FlushSubmissions();
     }
 
-    if (active_requests > 0 || in_flight_sqes > 0 ||
-        (direct_fds_supported && direct_fd_free_list.size() < static_cast<size_t>(DIRECT_FD_TABLE_SIZE))) {
+    if (active_requests > 0 || in_flight_sqes > 0 || direct_slots.AnyInUse()) {
         return false;
     }
 
@@ -393,24 +517,49 @@ static bool EnsureCredentialsSafe() {
     ClosePollHandle();
     io_uring_queue_exit(&ring);
 
-    int ret = InitRingWithBestFlags(stats.queue_depth, &ring);
+    int ret = InitRingWithRestrictionsAndBestFlags(stats.queue_depth, &ring);
     if (ret < 0) {
         ring_supported = false;
-        direct_fds_supported = false;
-        direct_fd_free_list.clear();
-        for (int i = 0; i < DIRECT_FD_TABLE_SIZE; ++i) direct_slot_allocated[i] = false;
-        unsupported_reason = std::string("Failed to reinitialize io_uring after UID/GID change: ") + uv_strerror(ret);
+        ring_restrictions_supported = false;
+        restricted_opcodes_count = 0;
+        direct_slots.Reset();
+        if (is_credential_reset) {
+            unsupported_reason = std::string("Failed to reinitialize io_uring after UID/GID change: ") + uv_strerror(ret);
+        }
         return false;
     }
 
-    InitDirectFdTable();
-
-    ring_euid = cur_uid;
-    ring_egid = cur_gid;
-    stats.credential_resets++;
+    ring_euid = geteuid();
+    ring_egid = getegid();
+    if (is_credential_reset) {
+        stats.credential_resets++;
+    }
 
     InitPollHandle(loop);
     return true;
+}
+
+// Mitigates CVE-2024-22017: If the process changed UID/GID (e.g. via setuid/setgid) and no operations
+// or live direct-FD handles are active, tears down and re-initializes the io_uring instance.
+static bool EnsureCredentialsSafe() {
+    if (!ring_supported) return false;
+
+    if (__builtin_expect(creds_checked_this_tick, 1)) {
+        return true;
+    }
+
+    uid_t cur_uid = geteuid();
+    gid_t cur_gid = getegid();
+    if (cur_uid == ring_euid && cur_gid == ring_egid) {
+        creds_checked_this_tick = true;
+        return true;
+    }
+
+    bool ok = ReinitIdleRing(true);
+    if (ok) {
+        creds_checked_this_tick = true;
+    }
+    return ok;
 }
 
 #endif // URING_FS_INTERNAL_RING_STATE_HPP
